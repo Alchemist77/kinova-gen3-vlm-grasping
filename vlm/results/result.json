@@ -1,0 +1,252 @@
+{
+  "success": true,
+  "target": "blue cup",
+  "object": "blue cup",
+  "image": "/home/abr-lab/catkin_ws/src/vlm_gen3_basic/vlm/data/captured_rgb.jpg",
+  "image_size": [
+    1280,
+    720
+  ],
+  "bbox": [
+    456,
+    266,
+    760,
+    560
+  ],
+  "grasp_region_bbox": [
+    456,
+    266,
+    760,
+    560
+  ],
+  "category": "cup",
+  "shape": "circular bowl",
+  "properties": {
+    "hollow": true,
+    "opening_visible": true,
+    "handle_visible": false,
+    "rigid": true,
+    "deformable": false
+  },
+  "grasp_affordance": {
+    "strategy": "rim_pinch",
+    "preferred_region": "the circular opening of the cup",
+    "region_bbox": [
+      456,
+      266,
+      760,
+      560
+    ],
+    "gripper_center_rule": "use_object_center",
+    "grasp_axis_rule": "parallel_to_edge",
+    "avoid_regions": [
+      "the interior of the cup",
+      "the bottom of the cup",
+      "the sides of the cup"
+    ],
+    "confidence": 0.95,
+    "reason": "The object is a hollow, circular cup with a visible opening. The gripper is positioned to grasp the rim, which is the most accessible and stable part. The opening is clearly visible, allowing for a rim_pinch grasp. The gripper center is aligned with the center of the opening, and the grasp axis is parallel to the edge of the rim."
+  },
+  "planner_mode": "rim_pinch",
+  "semantic_strategy_original": "rim_pinch",
+  "plate_edge_override_applied": false,
+  "gripper_center_rule": "use_object_center",
+  "grasp_axis_rule": "parallel_to_edge",
+  "candidate_count": 14,
+  "valid_candidate_count": 2,
+  "original_grasp_pixel": [
+    546,
+    536
+  ],
+  "grasp_pixel": [
+    541,
+    547
+  ],
+  "center_pixel": [
+    541,
+    547
+  ],
+  "depth_pixel": [
+    546,
+    536
+  ],
+  "depth_m": 0.36899998784065247,
+  "measured_depth_m": 0.36899998784065247,
+  "rim_crest_depth_m": 0.36899998784065247,
+  "stable_surface_ridge": {
+    "ridge_pixel_rgb": [
+      541,
+      547
+    ],
+    "final_pixel_rgb": [
+      541,
+      547
+    ],
+    "ridge_depth_m": 0.36899998784065247,
+    "radial_direction_rgb": [
+      -0.45011520746885386,
+      0.8929704922365972
+    ],
+    "inward_offset_m": 0.0,
+    "inward_offset_px": 0.0,
+    "run_spread_m": 0.0010000169277191162,
+    "run_support": 21,
+    "seed_pixel_rgb": [
+      546,
+      536
+    ],
+    "search_radius_px": 28,
+    "lateral_half_width_px": 3,
+    "stable_run_px": 3,
+    "rgb_edge_distance_px": 0.9549999833106995,
+    "normalized_radial_position": 1.0125440371719514,
+    "edge_gate_passed": true,
+    "radial_gate_passed": true,
+    "cavity_depth_gate_passed": true
+  },
+  "stable_surface_ridge_policy": "validated_nearest_rim_surface",
+  "rim_crest_percentile": 20.0,
+  "surface_standoff_m": 0.0,
+  "applied_outward_offset_m": 0.0,
+  "opening_depth_evidence": {
+    "validated": true,
+    "reason": "connected recessed cavity found",
+    "interior_depth_m": 0.46700000762939453,
+    "rim_depth_m": 0.375,
+    "depth_difference_m": 0.09200000762939453,
+    "raw_depth_difference_m": 0.09200000762939453,
+    "interior_sample_count": 534,
+    "rim_sample_count": 15,
+    "sampling_mode": "connected_dense_opening_search",
+    "selected_rim_pixel_rgb": [
+      546,
+      536
+    ],
+    "opening_center_pixel_rgb": [
+      608,
+      413
+    ],
+    "detected_cavity_center_pixel_rgb": [
+      610,
+      410
+    ],
+    "cavity_component_count": 1,
+    "selected_component_size": 534,
+    "cavity_margin_m": 0.003,
+    "rim_depth_mad_m": 0.0009999871253967285,
+    "interior_depth_percentile": 80.0,
+    "candidate_used_global_cavity": false
+  },
+  "recommended_grasp_clearance_m": 0.01,
+  "thin_object_mode": false,
+  "clearance_model": {
+    "type": "fixed_tcp_to_finger_contact_offset",
+    "normal_contact_offset_m": 0.01,
+    "thin_edge_contact_offset_m": 0.003,
+    "thin_object_width_threshold_m": 0.012,
+    "selected_contact_offset_m": 0.01,
+    "plate_like_category": false,
+    "thin_mode_decision_basis": "measured_local_width_only",
+    "measured_local_width_m": 0.01068592478334571,
+    "measured_opening_recess_used_for_validation": true,
+    "measured_opening_recess_used_for_clearance": false
+  },
+  "object_size_estimate": {
+    "bbox_width_m": 0.08784956490083266,
+    "bbox_height_m": 0.08489707299102432,
+    "estimated_closing_width_m": 0.01068592478334571,
+    "width_estimation_mode": "radial_local_depth_span",
+    "local_width_axis": "radial",
+    "local_span_depth_px": 37,
+    "radial_direction_rgb": [
+      -62.0,
+      123.0
+    ],
+    "candidate_bbox": [
+      456,
+      266,
+      760,
+      560
+    ],
+    "gripper_max_opening_m": 0.1,
+    "gripper_safety_margin_m": 0.012,
+    "usable_gripper_width_m": 0.08800000000000001,
+    "min_local_grasp_width_m": 0.003,
+    "max_local_span_fraction": 0.7,
+    "rim_max_local_span_fraction": 0.4,
+    "rim_validated_opening_span_fraction": 0.65,
+    "selected_radial_span_fraction": 0.12163890390815614,
+    "requested_rim_inner_ratio": 0.8,
+    "effective_rim_inner_ratio": 0.9,
+    "requested_rim_outer_ratio": 0.96,
+    "effective_rim_outer_ratio": 0.96,
+    "requested_rim_edge_max_distance_px": 8.0,
+    "rim_edge_max_distance_px": 4.0,
+    "require_validated_opening_for_rim": true
+  },
+  "point_camera_m": {
+    "x": -0.0029439778940267163,
+    "y": 0.0933516402935336,
+    "z": 0.36899998784065247
+  },
+  "camera_frame": "camera_depth_frame",
+  "point_source": "native_depth_intrinsics_and_depth_frame",
+  "native_depth_correspondence": {
+    "point_depth_m": {
+      "x": -0.0029439778940267163,
+      "y": 0.0933516402935336,
+      "z": 0.36899998784065247
+    },
+    "native_depth_pixel": [
+      241,
+      229
+    ],
+    "reprojected_color_pixel": [
+      541.9846413637308,
+      549.2185720455345
+    ],
+    "reprojection_error_px": 2.427257822398961,
+    "color_frame_depth_m": 0.3689999878406525
+  },
+  "depth_frame": "camera_depth_frame",
+  "color_frame": "camera_color_frame",
+  "depth_registration": {
+    "mode": "depth_to_color_3d_reprojection",
+    "depth_frame": "camera_depth_frame",
+    "color_frame": "camera_color_frame",
+    "translation_color_from_depth_m": [
+      -0.019500000000000073,
+      -0.0050000000000000044,
+      5.551115123125783e-17
+    ],
+    "quaternion_color_from_depth": [
+      0.0,
+      0.0,
+      0.0,
+      1.0000000000000029
+    ],
+    "splat_radius_px": 2,
+    "registered_valid_coverage": 0.9492339409722222
+  },
+  "native_depth_image_size": [
+    480,
+    270
+  ],
+  "selection_score": 0.657894737446177,
+  "grasp_source": "qwen_strategy_plus_depth_opening_and_gripper_validation",
+  "point_base_m": {
+    "x": 0.2761649233460849,
+    "y": 0.07439623370925869,
+    "z": 0.10427915726923487
+  },
+  "planning_frame": "base_link",
+  "joint7_rotation_decision": {
+    "dx_px": -67.0,
+    "dy_px": 134.0,
+    "radial_angle_deg": 116.56505117707799,
+    "axis_angle_deg": -63.43494882292201,
+    "command_deg": 63.43494882292201,
+    "angle_sign": -1.0,
+    "angle_offset_deg": 0.0
+  }
+}

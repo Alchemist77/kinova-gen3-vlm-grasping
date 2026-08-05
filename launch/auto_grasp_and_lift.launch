@@ -1,0 +1,47 @@
+<launch>
+  <!-- Run initial_setup.launch separately first. This launch starts the full
+       VLM -> XY -> pregrasp -> grasp -> close -> lift pipeline. -->
+
+  <arg name="target" default="yellow bowl"/>
+
+  <!-- Safety: keep false for the first test -->
+  <arg name="execute" default="false"/>
+  <arg name="allow_motion" default="false"/>
+
+  <arg name="result_json"
+       default="/home/abr-lab/catkin_ws/src/vlm_gen3_basic/vlm/results/result.json"/>
+  <arg name="camera_frame_override" default="camera_color_frame"/>
+
+  <arg name="pregrasp_offset_m" default="0.10"/>
+<arg name="grasp_clearance_m" default="0.03"/>
+<arg name="auto_grasp_clearance" default="false"/>
+  <arg name="close_joint_value" default="1.0"/>
+  <arg name="close_named_target" default=""/>
+  <arg name="lift_distance_m" default="0.10"/>
+
+  <node pkg="vlm_gen3_basic"
+        type="14_auto_grasp_and_lift.py"
+        name="vlm_gen3_auto_grasp_and_lift"
+        output="screen"
+        required="true">
+
+    <param name="target" value="$(arg target)"/>
+    <param name="execute" value="$(arg execute)"/>
+    <param name="allow_motion" value="$(arg allow_motion)"/>
+
+    <param name="result_json" value="$(arg result_json)"/>
+    <param name="camera_frame_override" value="$(arg camera_frame_override)"/>
+
+<param name="pregrasp_offset_m"
+       value="$(arg pregrasp_offset_m)"/>
+
+<param name="grasp_clearance_m"
+       value="$(arg grasp_clearance_m)"/>
+
+<param name="auto_grasp_clearance"
+       value="$(arg auto_grasp_clearance)"/>
+    <param name="close_joint_value" value="$(arg close_joint_value)"/>
+    <param name="close_named_target" value="$(arg close_named_target)"/>
+    <param name="lift_distance_m" value="$(arg lift_distance_m)"/>
+  </node>
+</launch>

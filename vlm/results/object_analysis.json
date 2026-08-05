@@ -1,0 +1,45 @@
+{
+  "success": true,
+  "target": "blue cup",
+  "object": "blue cup",
+  "image": "/home/abr-lab/catkin_ws/src/vlm_gen3_basic/vlm/data/captured_rgb.jpg",
+  "image_size": [
+    1280,
+    720
+  ],
+  "bbox": [
+    456,
+    266,
+    760,
+    560
+  ],
+  "category": "cup",
+  "shape": "circular bowl",
+  "properties": {
+    "hollow": true,
+    "opening_visible": true,
+    "handle_visible": false,
+    "rigid": true,
+    "deformable": false
+  },
+  "grasp_affordance": {
+    "strategy": "rim_pinch",
+    "preferred_region": "the circular opening of the cup",
+    "region_bbox": [
+      456,
+      266,
+      760,
+      560
+    ],
+    "gripper_center_rule": "use_object_center",
+    "grasp_axis_rule": "parallel_to_edge",
+    "avoid_regions": [
+      "the interior of the cup",
+      "the bottom of the cup",
+      "the sides of the cup"
+    ],
+    "confidence": 0.95,
+    "reason": "The object is a hollow, circular cup with a visible opening. The gripper is positioned to grasp the rim, which is the most accessible and stable part. The opening is clearly visible, allowing for a rim_pinch grasp. The gripper center is aligned with the center of the opening, and the grasp axis is parallel to the edge of the rim."
+  },
+  "raw_output": "```json\n{\n  \"object\": \"blue cup\",\n  \"bbox_1000\": [356, 370, 594, 778],\n  \"category\": \"cup\",\n  \"shape\": \"circular bowl\",\n  \"hollow\": true,\n  \"opening_visible\": true,\n  \"handle_visible\": false,\n  \"rigid\": true,\n  \"deformable\": false,\n  \"grasp_strategy\": \"rim_pinch\",\n  \"preferred_grasp_region\": \"the circular opening of the cup\",\n  \"grasp_region_bbox_1000\": [356, 370, 594, 778],\n  \"gripper_center_rule\": \"use_object_center\",\n  \"grasp_axis_rule\": \"parallel_to_edge\",\n  \"avoid_grasp_regions\": [\n    \"the interior of the cup\",\n    \"the bottom of the cup\",\n    \"the sides of the cup\"\n  ],\n  \"grasp_confidence\": 0.95,\n  \"grasp_reason\": \"The object is a hollow, circular cup with a visible opening. The gripper is positioned to grasp the rim, which is the most accessible and stable part. The opening is clearly visible, allowing for a rim_pinch grasp. The gripper center is aligned with the center of the opening, and the grasp axis is parallel to the edge of the rim.\"\n}\n```"
+}

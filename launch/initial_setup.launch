@@ -1,0 +1,77 @@
+<launch>
+  <!--
+    INITIAL TUTORIAL SETUP
+    1. Connect Kinova Gen3
+    2. Start wrist RGB-D camera
+    3. Load the saved home pose
+    4. Automatically plan and move the 7 arm joints to home
+
+    WARNING: This launch intentionally moves the robot.
+  -->
+
+  <arg name="start_robot" default="true" />
+  <arg name="start_camera" default="true" />
+  <arg name="move_home" default="true" />
+  <arg name="run_camera_viewer" default="false" />
+
+  <arg name="joint_state_topic" default="/joint_states" />
+  <arg name="color_topic" default="/camera/color/image_raw" />
+  <arg name="move_group_name" default="arm" />
+  <arg name="start_delay_sec" default="3.0" />
+
+  <rosparam command="load" file="$(find vlm_gen3_basic)/config/robot.yaml" />
+  <rosparam command="load" file="$(find vlm_gen3_basic)/config/camera.yaml" />
+
+  <include if="$(arg start_robot)"
+           file="$(find kortex_driver)/launch/kortex_driver.launch" />
+
+  <include if="$(arg start_camera)"
+           file="$(find kinova_vision)/launch/kinova_vision.launch" />
+
+  <node if="$(arg move_home)"
+        pkg="vlm_gen3_basic"
+        type="03_move_home.py"
+        name="vlm_gen3_move_home"
+        output="screen"
+        required="false">
+    <param name="joint_state_topic" value="$(arg joint_state_topic)" />
+    <param name="move_group_name" value="$(arg move_group_name)" />
+    <param name="start_delay_sec" value="$(arg start_delay_sec)" />
+    <rosparam param="home_joint_positions">[-0.05332660503552855, 0.02032707012095037, 3.0571781702014422, -1.7819897949281422, -0.003400324079812833, -1.38114570135152, 1.4293124317750199]</rosparam>
+    <param name="home_tolerance_rad" value="0.02" />
+    <param name="velocity_scale" value="0.3" />
+    <param name="acceleration_scale" value="0.2" />
+  </node>
+  
+  <node pkg="vlm_gen3_basic"
+      type="11_close_gripper.py"
+      name="vlm_gen3_open_gripper"
+      output="screen"
+      required="false"
+      launch-prefix="bash -c 'sleep 9; exec &quot;$0&quot; &quot;$@&quot;'">
+
+  <param name="close_joint_value" value="0.0"/>
+  <param name="execute" value="true"/>
+  <param name="allow_motion" value="true"/>
+</node>
+
+  <node if="$(arg run_camera_viewer)"
+        pkg="vlm_gen3_basic"
+        type="02_view_wrist_camera.py"
+        name="vlm_gen3_camera_viewer"
+        output="screen">
+    <param name="image_topic" value="$(arg color_topic)" />
+  </node>
+  
+<!--
+  <node pkg="vlm_gen3_basic"
+      type="11_close_gripper.py"
+      name="vlm_gen3_open_gripper"
+      output="screen"
+      required="false">
+    <param name="close_joint_value" value="0.0" />
+    <param name="execute" value="true" />
+    <param name="allow_motion" value="true" />
+  </node>
+-->
+</launch>

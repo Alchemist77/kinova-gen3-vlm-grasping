@@ -1,0 +1,219 @@
+#!/usr/bin/python3
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import rospy
+
+
+def b(v):
+    return "true" if bool(v) else "false"
+
+
+def run(label, cmd):
+    rospy.loginfo("========== %s ==========", label)
+    rospy.loginfo("Running: %s", " ".join(cmd))
+    rc = subprocess.run(cmd).returncode
+    if rc:
+        raise RuntimeError(f"{label} failed with exit code {rc}")
+
+
+def main():
+    rospy.init_node("vlm_gen3_auto_grasp_and_lift", anonymous=False)
+
+    p = lambda name, default: rospy.get_param("~" + name, default)
+
+    target = p("target", "yellow bowl")
+    result_json = p(
+        "result_json",
+        "/home/abr-lab/catkin_ws/src/vlm_gen3_basic/vlm/results/result.json",
+    )
+    camera = p("camera_frame_override", "camera_color_frame")
+    execute = bool(p("execute", False))
+    allow = bool(p("allow_motion", False))
+
+    pre = float(p("pregrasp_offset_m", 0.13))
+    grasp = float(p("grasp_clearance_m", 0.08))
+    auto_grasp_clearance = bool(p("auto_grasp_clearance", True))
+    min_grasp_clearance = float(p("min_grasp_clearance_m", 0.003))
+    max_grasp_clearance = float(p("max_grasp_clearance_m", 0.120))
+    close = float(p("close_joint_value", 1.0))
+    lift = float(p("lift_distance_m", 0.10))
+    keep_closing = bool(p("keep_closing_during_lift", True))
+    gripper_repeat_hz = float(p("gripper_repeat_hz", 3.0))
+
+    xy_vel = float(p("xy_velocity_scale", 0.30))
+    xy_acc = float(p("xy_acceleration_scale", 0.20))
+    wrist_vel = float(p("wrist_velocity_scale", 0.50))
+    wrist_acc = float(p("wrist_acceleration_scale", 0.35))
+
+    rim_enabled = bool(p("rim_grasp_enabled", True))
+    rim_inner = float(p("rim_inner_ratio", 0.80))
+    rim_outer = float(p("rim_outer_ratio", 0.96))
+    rim_inset = int(p("rim_inset_px", 5))
+    surface_standoff = float(p("surface_standoff_m", 0.0))
+    depth_frame_count = max(1, int(p("depth_frame_count", 7)))
+    depth_frame_interval_sec = max(
+        0.0, float(p("depth_frame_interval_sec", 0.06))
+    )
+    cavity_min_frame_support = max(
+        1, int(p("cavity_min_frame_support", 2))
+    )
+
+    save_clean = bool(p("save_clean_grasp_image", True))
+    save_debug = bool(p("save_debug_grasp_image", True))
+    save_info = bool(p("save_grasp_info_text", True))
+
+    if not (0.0 <= rim_inner < rim_outer <= 1.0):
+        raise ValueError("Require 0 <= rim_inner_ratio < rim_outer_ratio <= 1")
+
+    if min_grasp_clearance < 0.0:
+        raise ValueError("min_grasp_clearance_m cannot be negative")
+    if max_grasp_clearance < min_grasp_clearance:
+        raise ValueError(
+            "max_grasp_clearance_m must be >= min_grasp_clearance_m"
+        )
+
+    base = ["rosrun", "vlm_gen3_basic"]
+
+    run("1/6 Detect and generate grasp only", base + [
+        "13_auto_to_pregrasp.py",
+        f"_target:={target}",
+        f"_result_json:={result_json}",
+        f"_camera_frame_override:={camera}",
+        f"_pregrasp_offset_m:={pre}",
+        f"_rim_grasp_enabled:={b(rim_enabled)}",
+        f"_rim_inner_ratio:={rim_inner}",
+        f"_rim_outer_ratio:={rim_outer}",
+        f"_rim_inset_px:={rim_inset}",
+        f"_surface_standoff_m:={surface_standoff}",
+        f"_depth_frame_count:={depth_frame_count}",
+        f"_depth_frame_interval_sec:={depth_frame_interval_sec}",
+        f"_cavity_min_frame_support:={cavity_min_frame_support}",
+        f"_save_clean_grasp_image:={b(save_clean)}",
+        f"_save_debug_grasp_image:={b(save_debug)}",
+        f"_save_grasp_info_text:={b(save_info)}",
+        "_skip_motion_stages:=true",
+        "_execute:=false",
+        "_allow_motion:=false",
+    ])
+
+    # The depth planner may recommend a safer final Z clearance for
+    # rim grasps by measuring center-depth minus rim-depth.
+    if auto_grasp_clearance:
+        result_path = Path(result_json)
+        if not result_path.is_file():
+            raise RuntimeError(
+                f"Detection completed but result JSON is missing: {result_json}"
+            )
+        result_data = json.loads(result_path.read_text())
+        recommended = result_data.get("recommended_grasp_clearance_m")
+        if recommended is not None:
+            recommended = float(recommended)
+            grasp = max(
+                min_grasp_clearance,
+                min(max_grasp_clearance, recommended),
+            )
+            rospy.logwarn(
+                "Adaptive grasp clearance selected: %.3f m "
+                "(planner recommendation %.3f m, class=%s)",
+                grasp,
+                recommended,
+                result_data.get("clearance_model", {}).get("type", "planner"),
+            )
+        else:
+            rospy.logwarn(
+                "No adaptive clearance recommendation; using launch fallback %.3f m",
+                grasp,
+            )
+
+    if grasp < 0.0:
+        raise ValueError("grasp_clearance_m cannot be negative")
+    if pre <= grasp:
+        raise ValueError(
+            "pregrasp_offset_m must be larger than final grasp clearance"
+        )
+
+    final_descent = pre - grasp
+    if final_descent > 0.15:
+        raise ValueError(
+            f"Final descent {final_descent:.3f} m exceeds 0.150 m limit"
+        )
+
+    rospy.logwarn(
+        "Final grasp descent: %.3f m (pregrasp %.3f - clearance %.3f)",
+        final_descent,
+        pre,
+        grasp,
+    )
+
+    run("2/6 Move X/Y and freeze base-frame target", base + [
+        "08_move_xy_cartesian.py",
+        f"_result_json:={result_json}",
+        f"_camera_frame_override:={camera}",
+        f"_execute:={b(execute)}",
+        f"_allow_motion:={b(allow)}",
+        "_max_xy_motion_m:=0.40",
+        f"_velocity_scale:={xy_vel}",
+        f"_acceleration_scale:={xy_acc}",
+    ])
+
+    run("3/6 Rotate wrist only if required", base + [
+        "09_rotate_wrist_from_grasp.py",
+        f"_result_json:={result_json}",
+        f"_execute:={b(execute)}",
+        f"_allow_motion:={b(allow)}",
+        f"_velocity_scale:={wrist_vel}",
+        f"_acceleration_scale:={wrist_acc}",
+    ])
+
+    run("4/6 Move to pregrasp using frozen base target", base + [
+        "09_move_z_pregrasp.py",
+        "_use_detected_grasp_z:=true",
+        f"_result_json:={result_json}",
+        f"_camera_frame_override:={camera}",
+        f"_pregrasp_offset_m:={pre}",
+        f"_execute:={b(execute)}",
+        f"_allow_motion:={b(allow)}",
+        "_max_z_motion_m:=0.35",
+        "_minimum_target_z_m:=0.05",
+    ])
+
+    run("5A/6 Descend to grasp", base + [
+        "10_move_z_grasp.py",
+        f"_pregrasp_offset_m:={pre}",
+        f"_grasp_clearance_m:={grasp}",
+        f"_execute:={b(execute)}",
+        f"_allow_motion:={b(allow)}",
+        "_max_z_motion_m:=0.15",
+    ])
+
+    run("5B/6 Close gripper", base + [
+        "11_close_gripper.py",
+        f"_close_joint_value:={close}",
+        f"_execute:={b(execute)}",
+        f"_allow_motion:={b(allow)}",
+    ])
+
+    run("6/6 Lift", base + [
+        "12_lift_after_grasp.py",
+        f"_lift_distance_m:={lift}",
+        f"_execute:={b(execute)}",
+        f"_allow_motion:={b(allow)}",
+        "_max_lift_m:=0.25",
+        f"_keep_closing_during_lift:={b(keep_closing)}",
+        f"_close_joint_value:={close}",
+        f"_gripper_repeat_hz:={gripper_repeat_hz}",
+        "_final_close_after_lift:=true",
+    ])
+
+    rospy.loginfo("AUTO GRASP AND LIFT COMPLETE.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        rospy.logerr("AUTO GRASP AND LIFT FAILED: %s", exc)
+        sys.exit(1)

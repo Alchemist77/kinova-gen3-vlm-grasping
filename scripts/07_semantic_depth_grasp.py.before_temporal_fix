@@ -1,0 +1,2298 @@
+#!/usr/bin/env python3
+"""
+Semantic + depth grasp-point planner with object-specific grasp strategies.
+
+Qwen supplies:
+- target bbox
+- visible object properties
+- grasp strategy
+- preferred region
+- center-offset rule
+
+This script:
+- generates strategy-specific candidate pixels
+- validates depth quality
+- estimates object size from depth and camera intrinsics
+- rejects grasps wider than the usable gripper opening
+- verifies a visible recessed opening before allowing outward rim offset
+- applies outward offset only for a validated open/hollow rim grasp
+
+The script does not move the robot.
+"""
+
+import json
+import math
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+import rospy
+import rospkg
+import tf2_ros
+from cv_bridge import CvBridge
+from sensor_msgs.msg import CameraInfo, Image
+
+
+def package_root():
+    return Path(rospkg.RosPack().get_path("vlm_gen3_basic"))
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+
+
+
+def rgb_edge_distance_px(image_bgr, point_rgb):
+    """Return distance in pixels from a point to the nearest strong RGB edge."""
+    if image_bgr is None:
+        return float("inf")
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 50, 140)
+
+    # distanceTransform measures distance to zero pixels, so invert edges.
+    inv = np.where(edges > 0, 0, 255).astype(np.uint8)
+    distance = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
+
+    u = int(round(point_rgb[0]))
+    v = int(round(point_rgb[1]))
+    h, w = distance.shape
+    if not (0 <= u < w and 0 <= v < h):
+        return float("inf")
+    return float(distance[v, u])
+
+
+def normalized_radial_position(bbox, point_rgb):
+    """Return normalized elliptical radial position inside a bbox."""
+    x1, y1, x2, y2 = bbox
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    half_w = max(1.0, 0.5 * (x2 - x1))
+    half_h = max(1.0, 0.5 * (y2 - y1))
+
+    nx = (float(point_rgb[0]) - cx) / half_w
+    ny = (float(point_rgb[1]) - cy) / half_h
+    return float(math.hypot(nx, ny))
+
+
+def stable_surface_ridge(
+    depth_m,
+    bbox,
+    seed_point_rgb,
+    fx,
+    scale_x,
+    scale_y,
+    min_depth,
+    max_depth,
+    search_radius_px=28,
+    lateral_half_width_px=3,
+    stable_run_px=3,
+    max_run_spread_m=0.006,
+    inward_offset_m=0.003,
+):
+    """Find a stable near-depth surface ridge around a grasp seed.
+
+    The search follows the radial direction from the object/opening centre
+    through the seed point. At each radial position, depth is summarized over
+    a short lateral strip. A candidate must be supported by a contiguous run
+    with low depth spread, so a single noisy minimum cannot win.
+
+    Returns a dictionary containing the ridge point and a small physical
+    inward offset point. The inward offset is expressed in metres and
+    converted to pixels using the measured depth.
+    """
+    h, w = depth_m.shape
+    x1, y1, x2, y2 = bbox
+    cx_rgb = 0.5 * (x1 + x2)
+    cy_rgb = 0.5 * (y1 + y2)
+    su, sv = float(seed_point_rgb[0]), float(seed_point_rgb[1])
+
+    ru = su - cx_rgb
+    rv = sv - cy_rgb
+    norm = math.hypot(ru, rv)
+    if norm < 1e-6:
+        return None
+
+    ru /= norm
+    rv /= norm
+    # Perpendicular direction for lateral support.
+    pu, pv = -rv, ru
+
+    samples = []
+    for t in range(-int(search_radius_px), int(search_radius_px) + 1):
+        u_rgb = su + ru * t
+        v_rgb = sv + rv * t
+
+        values = []
+        for lateral in range(
+            -int(lateral_half_width_px),
+            int(lateral_half_width_px) + 1,
+        ):
+            uu = int(round((u_rgb + pu * lateral) * scale_x))
+            vv = int(round((v_rgb + pv * lateral) * scale_y))
+            if 0 <= uu < w and 0 <= vv < h:
+                value = float(depth_m[vv, uu])
+                if (
+                    math.isfinite(value)
+                    and min_depth <= value <= max_depth
+                ):
+                    values.append(value)
+
+        if len(values) >= max(3, lateral_half_width_px + 1):
+            arr = np.asarray(values, dtype=np.float64)
+            samples.append(
+                {
+                    "t": int(t),
+                    "u_rgb": float(u_rgb),
+                    "v_rgb": float(v_rgb),
+                    "depth_m": float(np.median(arr)),
+                    "support": int(arr.size),
+                    "mad_m": float(
+                        np.median(np.abs(arr - np.median(arr)))
+                    ),
+                }
+            )
+
+    if len(samples) < stable_run_px:
+        return None
+
+    # Find contiguous stable runs. The score prefers:
+    # 1) smaller/nearer depth,
+    # 2) high support,
+    # 3) proximity to the original VLM/depth candidate.
+    candidates = []
+    half = stable_run_px // 2
+    for i in range(half, len(samples) - half):
+        run = samples[i - half:i + half + 1]
+        t_values = [item["t"] for item in run]
+        if max(t_values) - min(t_values) > stable_run_px + 1:
+            continue
+
+        depths = np.asarray(
+            [item["depth_m"] for item in run],
+            dtype=np.float64,
+        )
+        spread = float(np.max(depths) - np.min(depths))
+        if spread > max_run_spread_m:
+            continue
+
+        centre = samples[i]
+        run_depth = float(np.median(depths))
+        support = sum(item["support"] for item in run)
+        score = (
+            run_depth
+            + 0.00010 * abs(centre["t"])
+            - 0.00001 * support
+        )
+        candidates.append(
+            {
+                "score": float(score),
+                "sample": centre,
+                "run_depth_m": run_depth,
+                "run_spread_m": spread,
+                "run_support": int(support),
+            }
+        )
+
+    if not candidates:
+        return None
+
+    chosen = min(candidates, key=lambda item: item["score"])
+    ridge = chosen["sample"]
+    ridge_depth = chosen["run_depth_m"]
+
+    # Move a small real-world distance from the ridge toward the object centre.
+    # This is not a fixed pixel heuristic.
+    inward_px = fx * max(0.0, inward_offset_m) / max(ridge_depth, 1e-6)
+    final_u = ridge["u_rgb"] - ru * inward_px
+    final_v = ridge["v_rgb"] - rv * inward_px
+    final_u = int(round(max(0, min(w / max(scale_x, 1e-6) - 1, final_u))))
+    final_v = int(round(max(0, min(h / max(scale_y, 1e-6) - 1, final_v))))
+
+    return {
+        "ridge_pixel_rgb": [
+            int(round(ridge["u_rgb"])),
+            int(round(ridge["v_rgb"])),
+        ],
+        "final_pixel_rgb": [final_u, final_v],
+        "ridge_depth_m": float(ridge_depth),
+        "radial_direction_rgb": [float(ru), float(rv)],
+        "inward_offset_m": float(inward_offset_m),
+        "inward_offset_px": float(inward_px),
+        "run_spread_m": float(chosen["run_spread_m"]),
+        "run_support": int(chosen["run_support"]),
+        "seed_pixel_rgb": [
+            int(round(su)),
+            int(round(sv)),
+        ],
+        "search_radius_px": int(search_radius_px),
+        "lateral_half_width_px": int(lateral_half_width_px),
+        "stable_run_px": int(stable_run_px),
+    }
+
+
+def robust_rim_crest_depth(
+    depth_m,
+    u_rgb,
+    v_rgb,
+    scale_x,
+    scale_y,
+    radius_depth,
+    min_depth,
+    max_depth,
+    percentile=20.0,
+):
+    """Estimate the top rim crest depth around a rim candidate."""
+    h, w = depth_m.shape
+    u = int(round(float(u_rgb) * scale_x))
+    v = int(round(float(v_rgb) * scale_y))
+    r = max(2, int(radius_depth) + 2)
+
+    values = []
+    for yy in range(max(0, v - r), min(h, v + r + 1)):
+        for xx in range(max(0, u - r), min(w, u + r + 1)):
+            value = float(depth_m[yy, xx])
+            if math.isfinite(value) and min_depth <= value <= max_depth:
+                values.append(value)
+
+    if len(values) < 5:
+        return None
+
+    return float(
+        np.percentile(
+            np.asarray(values, dtype=np.float64),
+            percentile,
+        )
+    )
+
+
+def depth_to_meters(array, encoding):
+    enc = (encoding or "").upper()
+    if enc in ("16UC1", "MONO16") or array.dtype == np.uint16:
+        return array.astype(np.float32) / 1000.0
+    if enc == "32FC1" or array.dtype in (np.float32, np.float64):
+        return array.astype(np.float32)
+    raise RuntimeError("Unsupported depth encoding: {}".format(encoding))
+
+
+def local_stats(depth, u, v, radius, min_depth, max_depth):
+    h, w = depth.shape
+    x1 = max(0, u - radius)
+    x2 = min(w, u + radius + 1)
+    y1 = max(0, v - radius)
+    y2 = min(h, v + radius + 1)
+    patch = depth[y1:y2, x1:x2]
+
+    valid = patch[
+        np.isfinite(patch)
+        & (patch > min_depth)
+        & (patch < max_depth)
+    ]
+    if valid.size == 0:
+        return None
+
+    median = float(np.median(valid))
+    mad = float(np.median(np.abs(valid - median)))
+    return {
+        "median_depth_m": median,
+        "mad_depth_m": mad,
+        "valid_ratio": float(valid.size / patch.size),
+        "valid_samples": int(valid.size),
+    }
+
+
+def read_depth_at_rgb(
+    depth_m,
+    u_rgb,
+    v_rgb,
+    scale_x,
+    scale_y,
+    radius_depth,
+    min_depth,
+    max_depth,
+):
+    depth_h, depth_w = depth_m.shape
+    u_depth = clamp(round(u_rgb * scale_x), 0, depth_w - 1)
+    v_depth = clamp(round(v_rgb * scale_y), 0, depth_h - 1)
+    stats = local_stats(
+        depth_m,
+        u_depth,
+        v_depth,
+        radius_depth,
+        min_depth,
+        max_depth,
+    )
+    return [int(u_depth), int(v_depth)], stats
+
+
+
+def quaternion_to_rotation_matrix(qx, qy, qz, qw):
+    """Return a 3x3 rotation matrix for a ROS quaternion."""
+    n = math.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+    if n < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    qx, qy, qz, qw = qx/n, qy/n, qz/n, qw/n
+    return np.array([
+        [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw), 2*(qx*qz + qy*qw)],
+        [2*(qx*qy + qz*qw), 1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw)],
+        [2*(qx*qz - qy*qw), 2*(qy*qz + qx*qw), 1 - 2*(qx*qx + qy*qy)],
+    ], dtype=np.float64)
+
+
+def register_depth_to_color(
+    depth_m,
+    depth_info,
+    color_info,
+    transform_color_from_depth,
+    color_width,
+    color_height,
+    min_depth,
+    max_depth,
+    splat_radius=2,
+):
+    """
+    Reproject the native depth image into the RGB image plane.
+
+    The old implementation only scaled RGB pixels by the resolution ratio.
+    That is incorrect for this Kinova camera because the color and depth
+    sensors have different intrinsics and a non-zero physical baseline.
+
+    This function back-projects every valid native depth pixel with the depth
+    intrinsics, transforms the 3-D point into camera_color_frame, and projects
+    it with the color intrinsics. A nearest-surface z-buffer is used.
+    """
+    dfx, dfy = float(depth_info.K[0]), float(depth_info.K[4])
+    dcx, dcy = float(depth_info.K[2]), float(depth_info.K[5])
+    cfx, cfy = float(color_info.K[0]), float(color_info.K[4])
+    ccx, ccy = float(color_info.K[2]), float(color_info.K[5])
+    if min(dfx, dfy, cfx, cfy) <= 0:
+        raise RuntimeError("Invalid depth/color camera intrinsics")
+
+    tr = transform_color_from_depth.transform.translation
+    qr = transform_color_from_depth.transform.rotation
+    rotation = quaternion_to_rotation_matrix(qr.x, qr.y, qr.z, qr.w)
+    translation = np.array([tr.x, tr.y, tr.z], dtype=np.float64).reshape(3, 1)
+
+    h, w = depth_m.shape
+    vv, uu = np.indices((h, w), dtype=np.float64)
+    zz = depth_m.astype(np.float64)
+    valid = np.isfinite(zz) & (zz > min_depth) & (zz < max_depth)
+    if not np.any(valid):
+        raise RuntimeError("Native depth image contains no valid points")
+
+    z = zz[valid]
+    u = uu[valid]
+    v = vv[valid]
+    x = (u - dcx) * z / dfx
+    y = (v - dcy) * z / dfy
+    points_depth = np.vstack((x, y, z))
+    points_color = rotation.dot(points_depth) + translation
+    xc, yc, zc = points_color
+
+    front = np.isfinite(zc) & (zc > min_depth) & (zc < max_depth)
+    xc, yc, zc = xc[front], yc[front], zc[front]
+    uc = np.rint(cfx * xc / zc + ccx).astype(np.int32)
+    vc = np.rint(cfy * yc / zc + ccy).astype(np.int32)
+    inside = (uc >= 0) & (uc < color_width) & (vc >= 0) & (vc < color_height)
+    uc, vc, zc = uc[inside], vc[inside], zc[inside].astype(np.float32)
+
+    registered = np.full((color_height, color_width), np.inf, dtype=np.float32)
+    radius = max(0, int(splat_radius))
+    for dy in range(-radius, radius + 1):
+        vv2 = vc + dy
+        valid_y = (vv2 >= 0) & (vv2 < color_height)
+        if not np.any(valid_y):
+            continue
+        for dx in range(-radius, radius + 1):
+            uu2 = uc + dx
+            ok = valid_y & (uu2 >= 0) & (uu2 < color_width)
+            if not np.any(ok):
+                continue
+            flat = vv2[ok] * color_width + uu2[ok]
+            np.minimum.at(registered.ravel(), flat, zc[ok])
+
+    registered[~np.isfinite(registered)] = np.nan
+    coverage = float(np.count_nonzero(np.isfinite(registered)) / registered.size)
+    return registered, {
+        "mode": "depth_to_color_3d_reprojection",
+        "depth_frame": depth_info.header.frame_id,
+        "color_frame": color_info.header.frame_id,
+        "translation_color_from_depth_m": [float(tr.x), float(tr.y), float(tr.z)],
+        "quaternion_color_from_depth": [float(qr.x), float(qr.y), float(qr.z), float(qr.w)],
+        "splat_radius_px": radius,
+        "registered_valid_coverage": coverage,
+    }
+
+
+def native_depth_point_for_color_pixel(
+    native_depth_m,
+    depth_info,
+    color_info,
+    transform_color_from_depth,
+    target_u_rgb,
+    target_v_rgb,
+    min_depth,
+    max_depth,
+    max_reprojection_error_px=5.0,
+):
+    """Return the native depth-frame 3-D point matching one RGB pixel.
+
+    Every valid native Kinova Vision depth pixel is back-projected using the
+    depth-camera intrinsics, transformed into the color-camera frame only for
+    RGB reprojection, and compared with the requested RGB grasp pixel. The
+    returned XYZ remains in camera_depth_frame.
+    """
+    dfx, dfy = float(depth_info.K[0]), float(depth_info.K[4])
+    dcx, dcy = float(depth_info.K[2]), float(depth_info.K[5])
+    cfx, cfy = float(color_info.K[0]), float(color_info.K[4])
+    ccx, ccy = float(color_info.K[2]), float(color_info.K[5])
+    if min(dfx, dfy, cfx, cfy) <= 0:
+        raise RuntimeError("Invalid depth/color camera intrinsics")
+
+    tr = transform_color_from_depth.transform.translation
+    qr = transform_color_from_depth.transform.rotation
+    rotation = quaternion_to_rotation_matrix(qr.x, qr.y, qr.z, qr.w)
+    translation = np.array(
+        [tr.x, tr.y, tr.z],
+        dtype=np.float64,
+    ).reshape(3, 1)
+
+    h, w = native_depth_m.shape
+    vv, uu = np.indices((h, w), dtype=np.float64)
+    zz = native_depth_m.astype(np.float64)
+    valid = (
+        np.isfinite(zz)
+        & (zz >= min_depth)
+        & (zz <= max_depth)
+    )
+    if not np.any(valid):
+        raise RuntimeError("No valid native depth pixels")
+
+    z_d = zz[valid]
+    u_d = uu[valid]
+    v_d = vv[valid]
+    x_d = (u_d - dcx) * z_d / dfx
+    y_d = (v_d - dcy) * z_d / dfy
+    points_depth = np.vstack((x_d, y_d, z_d))
+
+    points_color = rotation.dot(points_depth) + translation
+    x_c, y_c, z_c = points_color
+    front = (
+        np.isfinite(z_c)
+        & (z_c >= min_depth)
+        & (z_c <= max_depth)
+    )
+    if not np.any(front):
+        raise RuntimeError("No depth points project in front of color camera")
+
+    x_d = x_d[front]
+    y_d = y_d[front]
+    z_d = z_d[front]
+    x_c = x_c[front]
+    y_c = y_c[front]
+    z_c = z_c[front]
+    u_d = u_d[front]
+    v_d = v_d[front]
+
+    u_rgb = cfx * x_c / z_c + ccx
+    v_rgb = cfy * y_c / z_c + ccy
+    error = np.hypot(
+        u_rgb - float(target_u_rgb),
+        v_rgb - float(target_v_rgb),
+    )
+    within = error <= float(max_reprojection_error_px)
+    if not np.any(within):
+        nearest = int(np.argmin(error))
+        if float(error[nearest]) > 12.0:
+            raise RuntimeError(
+                "No native depth correspondence near RGB grasp pixel; "
+                "nearest reprojection error={:.2f}px".format(
+                    float(error[nearest])
+                )
+            )
+        indices = np.array([nearest], dtype=np.int64)
+    else:
+        indices = np.flatnonzero(within)
+
+    # Prefer the nearest visible surface, then the smallest reprojection error.
+    order = np.lexsort((error[indices], z_c[indices]))
+    chosen = int(indices[order[0]])
+
+    return {
+        "point_depth_m": {
+            "x": float(x_d[chosen]),
+            "y": float(y_d[chosen]),
+            "z": float(z_d[chosen]),
+        },
+        "native_depth_pixel": [
+            int(round(u_d[chosen])),
+            int(round(v_d[chosen])),
+        ],
+        "reprojected_color_pixel": [
+            float(u_rgb[chosen]),
+            float(v_rgb[chosen]),
+        ],
+        "reprojection_error_px": float(error[chosen]),
+        "color_frame_depth_m": float(z_c[chosen]),
+    }
+
+
+def normalize(vx, vy):
+    length = math.hypot(vx, vy)
+    if length < 1e-6:
+        return 0.0, 0.0
+    return vx / length, vy / length
+
+
+def candidate_region_score(strategy, nx, ny, radial):
+    """
+    nx, ny are normalized bbox coordinates in approximately [-1, 1].
+    """
+    if strategy == "rim_pinch":
+        return max(0.0, 1.0 - abs(radial - 0.84) / 0.14)
+
+    if strategy == "outer_side_pinch":
+        side_bias = abs(nx)
+        vertical_penalty = 0.25 * abs(ny)
+        return max(0.0, min(1.0, side_bias - vertical_penalty))
+
+    if strategy == "handle_pinch":
+        # Without a segmentation mask, prefer narrow regions away from the
+        # widest central body. The VLM preferred-region text is preserved,
+        # while depth quality determines the final point.
+        return max(0.0, min(1.0, 0.45 + 0.40 * radial))
+
+    if strategy == "neck_pinch":
+        return max(0.0, min(1.0, 0.75 - 0.50 * abs(nx) - 0.20 * abs(ny + 0.45)))
+
+    if strategy == "edge_pinch":
+        return max(0.0, min(1.0, radial))
+
+    if strategy == "top_surface":
+        return max(0.0, 1.0 - radial)
+
+    # body_center and fallback
+    return max(0.0, 1.0 - 0.65 * radial)
+
+
+def generate_candidates(
+    bbox,
+    strategy,
+    step_px,
+    rim_inner_ratio,
+    rim_outer_ratio,
+):
+    x1, y1, x2, y2 = bbox
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+
+    candidates = []
+
+    for v in range(y1 + step_px, y2 - step_px + 1, step_px):
+        for u in range(x1 + step_px, x2 - step_px + 1, step_px):
+            nx = (u - cx) / max(1.0, 0.5 * width)
+            ny = (v - cy) / max(1.0, 0.5 * height)
+            radial = math.hypot(nx, ny)
+
+            if strategy == "rim_pinch":
+                if not (rim_inner_ratio <= radial <= rim_outer_ratio):
+                    continue
+            elif strategy in ("outer_side_pinch", "edge_pinch"):
+                if not (0.50 <= radial <= 0.94):
+                    continue
+            elif strategy == "handle_pinch":
+                if radial > 0.95:
+                    continue
+            elif strategy == "neck_pinch":
+                if radial > 0.90:
+                    continue
+            elif strategy == "top_surface":
+                if radial > 0.72:
+                    continue
+            else:
+                if radial > 0.82:
+                    continue
+
+            candidates.append({
+                "point_rgb": [int(u), int(v)],
+                "radial_position": float(radial),
+                "semantic_region_score": candidate_region_score(
+                    strategy,
+                    nx,
+                    ny,
+                    radial,
+                ),
+                "mode": strategy,
+            })
+
+    return candidates
+
+
+
+def depth_connected_span_px(
+    depth_m,
+    u_depth,
+    v_depth,
+    axis,
+    reference_depth_m,
+    depth_tolerance_m,
+    max_scan_px,
+    min_depth,
+    max_depth,
+):
+    """
+    Measure the local same-surface span through a candidate along one image
+    axis. Scanning stops at invalid depth or a depth discontinuity.
+
+    axis='horizontal' estimates left-right local width.
+    axis='vertical' estimates up-down local width.
+    """
+    h, w = depth_m.shape
+
+    def same_surface(u, v):
+        if not (0 <= u < w and 0 <= v < h):
+            return False
+        value = float(depth_m[v, u])
+        return (
+            math.isfinite(value)
+            and min_depth < value < max_depth
+            and abs(value - reference_depth_m) <= depth_tolerance_m
+        )
+
+    negative = 0
+    positive = 0
+
+    for step in range(1, max_scan_px + 1):
+        u = u_depth - step if axis == "horizontal" else u_depth
+        v = v_depth if axis == "horizontal" else v_depth - step
+        if not same_surface(u, v):
+            break
+        negative = step
+
+    for step in range(1, max_scan_px + 1):
+        u = u_depth + step if axis == "horizontal" else u_depth
+        v = v_depth if axis == "horizontal" else v_depth + step
+        if not same_surface(u, v):
+            break
+        positive = step
+
+    return negative + positive + 1
+
+
+
+def depth_connected_span_direction_px(
+    depth_m,
+    u_depth,
+    v_depth,
+    du,
+    dv,
+    reference_depth_m,
+    depth_tolerance_m,
+    max_scan_px,
+    min_depth,
+    max_depth,
+):
+    """
+    Measure a same-surface span along an arbitrary image-plane direction.
+
+    This is used for rim/edge grasps:
+    - inward scan stops at the recessed opening or tray interior
+    - outward scan stops at background/table depth
+    - the remaining connected span approximates the local rim/edge thickness
+    """
+    h, w = depth_m.shape
+    norm = math.hypot(du, dv)
+    if norm < 1e-6:
+        return 1
+
+    du /= norm
+    dv /= norm
+
+    def same_surface(u_float, v_float):
+        u = int(round(u_float))
+        v = int(round(v_float))
+        if not (0 <= u < w and 0 <= v < h):
+            return False
+        value = float(depth_m[v, u])
+        return (
+            math.isfinite(value)
+            and min_depth < value < max_depth
+            and abs(value - reference_depth_m) <= depth_tolerance_m
+        )
+
+    negative = 0
+    positive = 0
+
+    for step in range(1, max_scan_px + 1):
+        if not same_surface(
+            u_depth - du * step,
+            v_depth - dv * step,
+        ):
+            break
+        negative = step
+
+    for step in range(1, max_scan_px + 1):
+        if not same_surface(
+            u_depth + du * step,
+            v_depth + dv * step,
+        ):
+            break
+        positive = step
+
+    return negative + positive + 1
+
+
+def radial_local_width_m(
+    candidate_bbox,
+    candidate,
+    depth_m,
+    scale_x,
+    scale_y,
+    fx,
+    fy,
+    depth_tolerance_m,
+    max_scan_px,
+    min_depth,
+    max_depth,
+):
+    """
+    Estimate local rim/edge thickness along the radial direction from the
+    grasp-region center to the candidate.
+
+    This allows a large bowl or tray to be grasped when only its local rim or
+    edge is narrow enough for the gripper.
+    """
+    x1, y1, x2, y2 = candidate_bbox
+    cx_rgb = 0.5 * (x1 + x2)
+    cy_rgb = 0.5 * (y1 + y2)
+
+    u_rgb, v_rgb = candidate["point_rgb"]
+    u_depth, v_depth = candidate["point_depth"]
+    reference_depth_m = candidate["depth_statistics"]["median_depth_m"]
+
+    du_rgb = u_rgb - cx_rgb
+    dv_rgb = v_rgb - cy_rgb
+    norm_rgb = math.hypot(du_rgb, dv_rgb)
+    if norm_rgb < 1e-6:
+        return None
+
+    # Convert the RGB direction into depth-image pixel coordinates.
+    du_depth = du_rgb * scale_x
+    dv_depth = dv_rgb * scale_y
+
+    span_depth_px = depth_connected_span_direction_px(
+        depth_m,
+        int(u_depth),
+        int(v_depth),
+        du_depth,
+        dv_depth,
+        reference_depth_m,
+        depth_tolerance_m,
+        max_scan_px,
+        min_depth,
+        max_depth,
+    )
+
+    # Convert one depth-image pixel step along this direction into meters.
+    dir_norm = math.hypot(du_depth, dv_depth)
+    dir_u = du_depth / max(dir_norm, 1e-6)
+    dir_v = dv_depth / max(dir_norm, 1e-6)
+
+    meters_per_depth_px = reference_depth_m * math.sqrt(
+        (dir_u / max(fx * scale_x, 1e-6)) ** 2
+        + (dir_v / max(fy * scale_y, 1e-6)) ** 2
+    )
+
+    width_m = span_depth_px * meters_per_depth_px
+
+    return {
+        "width_m": float(width_m),
+        "axis": "radial",
+        "span_depth_px": int(span_depth_px),
+        "radial_direction_rgb": [float(du_rgb), float(dv_rgb)],
+    }
+
+def local_closing_width_m(
+    bbox,
+    candidate,
+    depth_m,
+    scale_x,
+    scale_y,
+    fx,
+    fy,
+    axis_rule,
+    depth_tolerance_m,
+    max_scan_px,
+    min_depth,
+    max_depth,
+):
+    """
+    Estimate width locally around the candidate instead of using the entire
+    object bbox. This is essential for objects such as a brush where the
+    handle is narrow but the brush head makes the full bbox wide.
+    """
+    u_rgb, v_rgb = candidate["point_rgb"]
+    u_depth, v_depth = candidate["point_depth"]
+    reference_depth_m = candidate["depth_statistics"]["median_depth_m"]
+
+    x1, y1, x2, y2 = bbox
+    bbox_width = max(1, x2 - x1)
+    bbox_height = max(1, y2 - y1)
+
+    if axis_rule == "perpendicular_to_handle":
+        # Infer visible handle's major direction from the grasp-region bbox.
+        # Tall region -> handle vertical -> gripper closes horizontally.
+        axis = "horizontal" if bbox_height >= bbox_width else "vertical"
+    elif axis_rule == "minor_axis":
+        axis = "horizontal" if bbox_width <= bbox_height else "vertical"
+    elif axis_rule == "parallel_to_edge":
+        axis = "horizontal" if bbox_width >= bbox_height else "vertical"
+    else:
+        axis = "horizontal" if bbox_width <= bbox_height else "vertical"
+
+    span_depth_px = depth_connected_span_px(
+        depth_m,
+        int(u_depth),
+        int(v_depth),
+        axis,
+        reference_depth_m,
+        depth_tolerance_m,
+        max_scan_px,
+        min_depth,
+        max_depth,
+    )
+
+    if axis == "horizontal":
+        span_rgb_px = span_depth_px / max(scale_x, 1e-6)
+        width_m = span_rgb_px * reference_depth_m / fx
+    else:
+        span_rgb_px = span_depth_px / max(scale_y, 1e-6)
+        width_m = span_rgb_px * reference_depth_m / fy
+
+    return float(width_m), axis, int(span_depth_px)
+
+def estimate_bbox_size_m(bbox, depth_m, fx, fy):
+    x1, y1, x2, y2 = bbox
+    width_px = max(1, x2 - x1)
+    height_px = max(1, y2 - y1)
+    return {
+        "bbox_width_m": float(width_px * depth_m / fx),
+        "bbox_height_m": float(height_px * depth_m / fy),
+    }
+
+
+def estimate_closing_width_m(
+    bbox,
+    depth_m,
+    fx,
+    fy,
+    axis_rule,
+    grasp_pixel,
+):
+    """
+    Conservative approximate width along the gripper closing direction.
+
+    For radial rim grasp, use the local radial thickness estimate only as a
+    conservative fraction of bbox size. For body grasps, use the minor bbox
+    dimension. Exact antipodal width requires segmentation/point-cloud logic,
+    so this estimate is intentionally conservative.
+    """
+    size = estimate_bbox_size_m(bbox, depth_m, fx, fy)
+    width_m = size["bbox_width_m"]
+    height_m = size["bbox_height_m"]
+
+    if axis_rule == "radial":
+        # Rim pinch is local wall/edge pinch, not full object diameter.
+        closing_width = 0.35 * min(width_m, height_m)
+    else:
+        closing_width = min(width_m, height_m)
+
+    return float(closing_width), size
+
+
+def opening_depth_evidence(
+    bbox,
+    depth_m,
+    scale_x,
+    scale_y,
+    radius_depth,
+    min_depth,
+    max_depth,
+    candidate_rgb,
+    threshold_m,
+):
+    """
+    Estimate a recessed opening from a dense, connected interior depth region.
+
+    The selected rim point supplies the local rim reference. The opening is
+    searched over a dense elliptical grid inside the object bbox. Grid cells
+    deeper than the rim reference are grouped into connected components. The
+    best component must be sufficiently large and reasonably close to the
+    opening centre, which suppresses isolated flying pixels and background
+    leakage. No cup/bowl/plate-specific clearance table is used.
+    """
+    x1, y1, x2, y2 = bbox
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    half_w = max(1.0, 0.5 * (x2 - x1))
+    half_h = max(1.0, 0.5 * (y2 - y1))
+
+    rim_u = float(candidate_rgb[0])
+    rim_v = float(candidate_rgb[1])
+
+    def get_depth(u, v):
+        _, stats = read_depth_at_rgb(
+            depth_m, u, v, scale_x, scale_y, radius_depth,
+            min_depth, max_depth,
+        )
+        if stats is None or stats["valid_ratio"] < 0.25:
+            return None
+        return float(stats["median_depth_m"])
+
+    # Robust local rim reference from tangential and slightly radial samples.
+    vx = rim_u - cx
+    vy = rim_v - cy
+    radial_norm = max(math.hypot(vx, vy), 1e-6)
+    rx, ry = vx / radial_norm, vy / radial_norm
+    tx, ty = -ry, rx
+    rim_depths = []
+    tangent_step = max(3.0, 0.018 * min(x2 - x1, y2 - y1))
+    radial_step = max(2.0, 0.010 * min(x2 - x1, y2 - y1))
+    for tangential_multiplier in (-2, -1, 0, 1, 2):
+        for radial_multiplier in (-1, 0, 1):
+            value = get_depth(
+                rim_u + tangential_multiplier * tangent_step * tx
+                + radial_multiplier * radial_step * rx,
+                rim_v + tangential_multiplier * tangent_step * ty
+                + radial_multiplier * radial_step * ry,
+            )
+            if value is not None:
+                rim_depths.append(value)
+
+    if len(rim_depths) < 5:
+        return {
+            "validated": False,
+            "reason": "insufficient local rim samples",
+            "interior_depth_m": None,
+            "rim_depth_m": None,
+            "depth_difference_m": None,
+            "interior_sample_count": 0,
+            "rim_sample_count": len(rim_depths),
+            "sampling_mode": "connected_dense_opening_search",
+        }
+
+    rim_depth = float(np.median(rim_depths))
+    rim_mad = float(np.median(np.abs(np.asarray(rim_depths) - rim_depth)))
+
+    # Dense grid inside the central 72% of the visible ellipse. Avoid the rim
+    # and sloping wall, while still covering enough area to find the cavity.
+    grid_nx = 31
+    grid_ny = 25
+    values = np.full((grid_ny, grid_nx), np.nan, dtype=np.float32)
+    pixels = [[None for _ in range(grid_nx)] for _ in range(grid_ny)]
+    valid_depths = []
+
+    for gy in range(grid_ny):
+        ny = -0.72 + 1.44 * gy / max(1, grid_ny - 1)
+        for gx in range(grid_nx):
+            nx = -0.72 + 1.44 * gx / max(1, grid_nx - 1)
+            if nx * nx + ny * ny > 0.72 * 0.72:
+                continue
+            u = cx + nx * half_w
+            v = cy + ny * half_h
+            value = get_depth(u, v)
+            if value is None:
+                continue
+            values[gy, gx] = value
+            pixels[gy][gx] = (u, v)
+            valid_depths.append(value)
+
+    if len(valid_depths) < 20:
+        return {
+            "validated": False,
+            "reason": "insufficient dense interior samples",
+            "interior_depth_m": None,
+            "rim_depth_m": rim_depth,
+            "depth_difference_m": None,
+            "interior_sample_count": len(valid_depths),
+            "rim_sample_count": len(rim_depths),
+            "sampling_mode": "connected_dense_opening_search",
+        }
+
+    # Require depth beyond local rim noise. Three millimetres is the sensor
+    # floor, while 3*MAD adapts to noisier captures.
+    cavity_margin = max(0.003, 3.0 * rim_mad)
+    cavity_mask = np.isfinite(values) & (values >= rim_depth + cavity_margin)
+
+    # Connected-component search on the coarse grid (8-connectivity).
+    visited = np.zeros_like(cavity_mask, dtype=bool)
+    components = []
+    neighbours = (
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),           (0, 1),
+        (1, -1),  (1, 0),  (1, 1),
+    )
+    for sy in range(grid_ny):
+        for sx in range(grid_nx):
+            if not cavity_mask[sy, sx] or visited[sy, sx]:
+                continue
+            stack = [(sy, sx)]
+            visited[sy, sx] = True
+            component = []
+            while stack:
+                yy, xx = stack.pop()
+                component.append((yy, xx))
+                for dy, dx in neighbours:
+                    nyy, nxx = yy + dy, xx + dx
+                    if (
+                        0 <= nyy < grid_ny and 0 <= nxx < grid_nx
+                        and cavity_mask[nyy, nxx]
+                        and not visited[nyy, nxx]
+                    ):
+                        visited[nyy, nxx] = True
+                        stack.append((nyy, nxx))
+            components.append(component)
+
+    best_component = None
+    best_score = -float("inf")
+    best_depth = None
+    best_center = None
+    for component in components:
+        if len(component) < 4:
+            continue
+        component_depths = np.asarray(
+            [values[yy, xx] for yy, xx in component], dtype=np.float64
+        )
+        component_depth = float(np.percentile(component_depths, 80.0))
+        mean_x = float(np.mean([xx for _, xx in component]))
+        mean_y = float(np.mean([yy for yy, _ in component]))
+        norm_x = (mean_x - 0.5 * (grid_nx - 1)) / max(1.0, 0.5 * (grid_nx - 1))
+        norm_y = (mean_y - 0.5 * (grid_ny - 1)) / max(1.0, 0.5 * (grid_ny - 1))
+        centre_distance = math.hypot(norm_x, norm_y)
+        recess = component_depth - rim_depth
+        # Prefer large, deep, central regions. Size has logarithmic influence.
+        score = (
+            4.0 * recess
+            + 0.006 * math.log1p(len(component))
+            - 0.012 * centre_distance
+        )
+        if score > best_score:
+            best_score = score
+            best_component = component
+            best_depth = component_depth
+            best_center = (mean_x, mean_y)
+
+    if best_component is None:
+        # Preserve diagnostic information rather than silently inventing depth.
+        deepest = float(np.percentile(valid_depths, 98.0))
+        raw_difference = deepest - rim_depth
+        return {
+            "validated": False,
+            "reason": "no connected recessed cavity found",
+            "interior_depth_m": deepest,
+            "rim_depth_m": rim_depth,
+            "depth_difference_m": max(0.0, float(raw_difference)),
+            "raw_depth_difference_m": float(raw_difference),
+            "interior_sample_count": len(valid_depths),
+            "rim_sample_count": len(rim_depths),
+            "sampling_mode": "connected_dense_opening_search",
+            "cavity_component_count": len(components),
+            "selected_component_size": 0,
+            "cavity_margin_m": cavity_margin,
+        }
+
+    raw_difference = float(best_depth - rim_depth)
+    difference = max(0.0, raw_difference)
+    validated = bool(difference >= threshold_m and len(best_component) >= 4)
+
+    mean_x, mean_y = best_center
+    centre_u = cx + (-0.72 + 1.44 * mean_x / max(1, grid_nx - 1)) * half_w
+    centre_v = cy + (-0.72 + 1.44 * mean_y / max(1, grid_ny - 1)) * half_h
+
+    return {
+        "validated": validated,
+        "reason": (
+            "connected recessed cavity found"
+            if validated else "connected cavity recess is below confidence threshold"
+        ),
+        "interior_depth_m": float(best_depth),
+        "rim_depth_m": rim_depth,
+        "depth_difference_m": float(difference),
+        "raw_depth_difference_m": raw_difference,
+        "interior_sample_count": len(valid_depths),
+        "rim_sample_count": len(rim_depths),
+        "sampling_mode": "connected_dense_opening_search",
+        "selected_rim_pixel_rgb": [int(round(rim_u)), int(round(rim_v))],
+        "opening_center_pixel_rgb": [int(round(cx)), int(round(cy))],
+        "detected_cavity_center_pixel_rgb": [
+            int(round(centre_u)), int(round(centre_v))
+        ],
+        "cavity_component_count": len(components),
+        "selected_component_size": len(best_component),
+        "cavity_margin_m": float(cavity_margin),
+        "rim_depth_mad_m": rim_mad,
+        "interior_depth_percentile": 80.0,
+    }
+
+def apply_outward_pixel_offset(
+    bbox,
+    grasp_pixel,
+    offset_m,
+    depth_m,
+    fx,
+    fy,
+    image_width,
+    image_height,
+):
+    x1, y1, x2, y2 = bbox
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+
+    vx = grasp_pixel[0] - cx
+    vy = grasp_pixel[1] - cy
+    ux, uy = normalize(vx, vy)
+
+    px_per_meter_x = fx / max(depth_m, 1e-6)
+    px_per_meter_y = fy / max(depth_m, 1e-6)
+
+    shifted_u = grasp_pixel[0] + ux * offset_m * px_per_meter_x
+    shifted_v = grasp_pixel[1] + uy * offset_m * px_per_meter_y
+
+    shifted_u = int(round(clamp(shifted_u, 0, image_width - 1)))
+    shifted_v = int(round(clamp(shifted_v, 0, image_height - 1)))
+
+    return [shifted_u, shifted_v]
+
+
+def main():
+    rospy.init_node("vlm_gen3_semantic_depth_grasp", anonymous=False)
+    root = package_root()
+
+    object_json = rospy.get_param(
+        "~object_json",
+        str(root / "vlm" / "results" / "object_analysis.json"),
+    )
+    result_json = rospy.get_param(
+        "~result_json",
+        str(root / "vlm" / "results" / "result.json"),
+    )
+    output_image = rospy.get_param(
+        "~output_image",
+        str(root / "vlm" / "results" / "validated_grasp.jpg"),
+    )
+
+    depth_topic = rospy.get_param(
+        "~depth_topic",
+        "/camera/depth/image_rect_raw",
+    )
+    camera_info_topic = rospy.get_param(
+        "~camera_info_topic",
+        "/camera/color/camera_info",
+    )
+    depth_camera_info_topic = rospy.get_param(
+        "~depth_camera_info_topic",
+        "/camera/depth/camera_info",
+    )
+    registration_splat_radius_px = int(
+        rospy.get_param("~registration_splat_radius_px", 2)
+    )
+
+    timeout = float(rospy.get_param("~timeout_sec", 15.0))
+    grid_step_px = int(rospy.get_param("~grid_step_px", 18))
+    sample_radius_rgb = int(rospy.get_param("~sample_radius", 7))
+    min_depth = float(rospy.get_param("~min_depth_m", 0.10))
+    max_depth = float(rospy.get_param("~max_depth_m", 3.00))
+    min_valid_ratio = float(rospy.get_param("~min_valid_ratio", 0.55))
+    max_mad = float(rospy.get_param("~max_depth_mad_m", 0.025))
+    rim_crest_percentile = float(
+        rospy.get_param("~rim_crest_percentile", 20.0)
+    )
+    ridge_search_radius_px = int(
+        rospy.get_param("~ridge_search_radius_px", 28)
+    )
+    ridge_lateral_half_width_px = int(
+        rospy.get_param("~ridge_lateral_half_width_px", 3)
+    )
+    ridge_stable_run_px = int(
+        rospy.get_param("~ridge_stable_run_px", 3)
+    )
+    ridge_max_run_spread_m = float(
+        rospy.get_param("~ridge_max_run_spread_m", 0.006)
+    )
+    ridge_inward_offset_m = float(
+        rospy.get_param("~ridge_inward_offset_m", 0.0)
+    )
+
+    requested_rim_inner_ratio = float(
+        rospy.get_param("~rim_inner_ratio", 0.76)
+    )
+    requested_rim_outer_ratio = float(
+        rospy.get_param("~rim_outer_ratio", 0.96)
+    )
+
+    # Hard safety bounds for rim grasps. A launch file may request 0.8, but
+    # points that deep inside the opening are cup-wall/interior candidates,
+    # not the top rim.
+    rim_inner_ratio = max(0.90, requested_rim_inner_ratio)
+    rim_outer_ratio = min(1.02, requested_rim_outer_ratio)
+    surface_standoff_m = float(rospy.get_param("~surface_standoff_m", 0.0))
+
+    gripper_max_opening_m = float(
+        rospy.get_param("~gripper_max_opening_m", 0.10)
+    )
+    gripper_safety_margin_m = float(
+        rospy.get_param("~gripper_safety_margin_m", 0.012)
+    )
+    outward_offset_m = float(
+        rospy.get_param("~outward_offset_m", 0.012)
+    )
+    opening_depth_threshold_m = float(
+        rospy.get_param("~opening_depth_threshold_m", 0.012)
+    )
+
+    # Rim-grasp Z model.
+    #
+    # The detected 3-D point already lies on the physical rim surface.
+    # Therefore the final Z clearance must be only the measured TCP-to-finger
+    # contact calibration. Opening/cavity depth is used for validation only
+    # and must never increase the final grasp height.
+    rim_contact_offset_m = float(
+        rospy.get_param("~rim_contact_offset_m", 0.010)
+    )
+    thin_edge_contact_offset_m = float(
+        rospy.get_param("~thin_edge_contact_offset_m", 0.003)
+    )
+    thin_object_width_threshold_m = float(
+        rospy.get_param("~thin_object_width_threshold_m", 0.012)
+    )
+    min_vlm_grasp_confidence = float(
+        rospy.get_param("~min_vlm_grasp_confidence", 0.45)
+    )
+    local_width_depth_tolerance_m = float(
+        rospy.get_param("~local_width_depth_tolerance_m", 0.018)
+    )
+    local_width_max_scan_px = int(
+        rospy.get_param("~local_width_max_scan_px", 100)
+    )
+    min_local_grasp_width_m = float(
+        rospy.get_param("~min_local_grasp_width_m", 0.003)
+    )
+    max_local_span_fraction = float(
+        rospy.get_param("~max_local_span_fraction", 0.70)
+    )
+    rim_max_local_span_fraction = float(
+        rospy.get_param("~rim_max_local_span_fraction", 0.40)
+    )
+    # A wider connected depth span can occur on a real cup rim because the
+    # low-resolution native depth image merges the thin rim with the nearby
+    # inner wall. Permit that wider span only after a recessed opening has
+    # independently been validated; do not globally weaken the rim gate.
+    rim_validated_opening_span_fraction = float(
+        rospy.get_param("~rim_validated_opening_span_fraction", 0.65)
+    )
+    requested_rim_edge_max_distance_px = float(
+        rospy.get_param("~rim_edge_max_distance_px", 8.0)
+    )
+
+    # Require the selected point to lie tightly on the visible RGB rim edge.
+    # The previous 8 px allowance accepted an inner-wall point at 7.8 px.
+    rim_edge_max_distance_px = min(
+        4.0,
+        requested_rim_edge_max_distance_px,
+    )
+    require_validated_opening_for_rim = bool(
+        rospy.get_param("~require_validated_opening_for_rim", True)
+    )
+
+    rospy.logwarn(
+        "Strict rim safety active: requested radial=[%.3f, %.3f], "
+        "effective radial=[%.3f, %.3f], requested edge<=%.2f px, "
+        "effective edge<=%.2f px",
+        requested_rim_inner_ratio,
+        requested_rim_outer_ratio,
+        rim_inner_ratio,
+        rim_outer_ratio,
+        requested_rim_edge_max_distance_px,
+        rim_edge_max_distance_px,
+    )
+
+    usable_gripper_width_m = (
+        gripper_max_opening_m - gripper_safety_margin_m
+    )
+    if usable_gripper_width_m <= 0:
+        raise RuntimeError("Invalid gripper opening and safety margin")
+
+    analysis = json.loads(Path(object_json).read_text())
+    rgb_image_for_validation = cv2.imread(analysis["image"])
+    if rgb_image_for_validation is None:
+        raise RuntimeError(
+            "Could not open RGB image for rim-edge validation: {}".format(
+                analysis["image"]
+            )
+        )
+
+    rgb_w, rgb_h = map(int, analysis["image_size"])
+    bbox = list(map(int, analysis["bbox"]))
+    properties = dict(analysis.get("properties", {}))
+    affordance = dict(analysis.get("grasp_affordance", {}))
+    grasp_region_bbox = affordance.get("region_bbox")
+    if (
+        isinstance(grasp_region_bbox, list)
+        and len(grasp_region_bbox) == 4
+    ):
+        candidate_bbox = list(map(int, grasp_region_bbox))
+    else:
+        candidate_bbox = list(bbox)
+
+    strategy = str(affordance.get("strategy", "not_graspable"))
+    category_lower = str(analysis.get("category", "")).strip().lower()
+    plate_like_category = category_lower in {
+        "plate",
+        "dish",
+        "tray",
+        "lid",
+        "saucer",
+    }
+
+    # Plate-like objects must be grasped at their outer edge with a parallel
+    # gripper. A body-center grasp would require opening across the full plate
+    # diameter and is physically impossible for this gripper. Therefore force
+    # any plate-like semantic result to edge_pinch, except explicitly
+    # ungraspable cases.
+    if (
+        plate_like_category
+        and strategy != "not_graspable"
+        and strategy != "handle_pinch"
+    ):
+        original_strategy = strategy
+        rospy.logwarn(
+            "Plate/thin-edge semantic override: category=%s "
+            "%s -> edge_pinch",
+            category_lower,
+            original_strategy,
+        )
+        strategy = "edge_pinch"
+
+    center_rule = str(
+        affordance.get("gripper_center_rule", "not_applicable")
+    )
+    axis_rule = str(affordance.get("grasp_axis_rule", "unknown"))
+    confidence = float(affordance.get("confidence", 0.0) or 0.0)
+
+    if strategy == "not_graspable":
+        raise RuntimeError(
+            "VLM marked the target as not_graspable: {}".format(
+                affordance.get("reason", "no reason")
+            )
+        )
+
+    if confidence < min_vlm_grasp_confidence:
+        raise RuntimeError(
+            "VLM grasp confidence {:.3f} is below minimum {:.3f}".format(
+                confidence,
+                min_vlm_grasp_confidence,
+            )
+        )
+
+    # Safety consistency gate.
+    outward_requested = center_rule == "shift_outward"
+    if outward_requested and not (
+        strategy == "rim_pinch"
+        and properties.get("hollow") is True
+        and properties.get("opening_visible") is True
+    ):
+        rospy.logwarn(
+            "Ignoring unsafe outward shift request: strategy=%s hollow=%s opening=%s",
+            strategy,
+            properties.get("hollow"),
+            properties.get("opening_visible"),
+        )
+        center_rule = "use_region_center"
+        outward_requested = False
+
+    candidates = generate_candidates(
+        candidate_bbox,
+        strategy,
+        grid_step_px,
+        rim_inner_ratio,
+        rim_outer_ratio,
+    )
+    if not candidates:
+        raise RuntimeError(
+            "No candidate pixels generated for strategy {}".format(strategy)
+        )
+
+    rospy.loginfo(
+        "Strategy=%s center_rule=%s axis_rule=%s confidence=%.3f",
+        strategy,
+        center_rule,
+        axis_rule,
+        confidence,
+    )
+    rospy.loginfo("Generated %d RGB candidates", len(candidates))
+    rospy.loginfo("Waiting for native depth to register into RGB: %s", depth_topic)
+
+    depth_msg = rospy.wait_for_message(depth_topic, Image, timeout=timeout)
+    info_msg = rospy.wait_for_message(
+        camera_info_topic,
+        CameraInfo,
+        timeout=timeout,
+    )
+    depth_info_msg = rospy.wait_for_message(
+        depth_camera_info_topic,
+        CameraInfo,
+        timeout=timeout,
+    )
+
+    raw_depth = CvBridge().imgmsg_to_cv2(
+        depth_msg,
+        desired_encoding="passthrough",
+    )
+    if raw_depth.ndim != 2:
+        raise RuntimeError(
+            "Invalid depth shape: {}".format(raw_depth.shape)
+        )
+
+    depth_h, depth_w = raw_depth.shape
+    native_depth_m = depth_to_meters(raw_depth, depth_msg.encoding)
+
+    color_frame = info_msg.header.frame_id or "camera_color_frame"
+    depth_frame = depth_info_msg.header.frame_id or depth_msg.header.frame_id
+    if not depth_frame:
+        raise RuntimeError("Depth frame_id is empty")
+
+    tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
+    tf_listener = tf2_ros.TransformListener(tf_buffer)
+    try:
+        transform_color_from_depth = tf_buffer.lookup_transform(
+            color_frame,
+            depth_frame,
+            rospy.Time(0),
+            rospy.Duration(timeout),
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not obtain depth-to-color TF {} <- {}: {}".format(
+                color_frame, depth_frame, exc
+            )
+        )
+
+    depth_m, registration_info = register_depth_to_color(
+        native_depth_m,
+        depth_info_msg,
+        info_msg,
+        transform_color_from_depth,
+        rgb_w,
+        rgb_h,
+        min_depth,
+        max_depth,
+        splat_radius=registration_splat_radius_px,
+    )
+    # The registered depth map is now in RGB pixel coordinates.
+    scale_x = 1.0
+    scale_y = 1.0
+    radius_depth = max(1, sample_radius_rgb)
+    rospy.logwarn(
+        "Registered native depth %dx%d into RGB %dx%d using 3-D reprojection; "
+        "coverage=%.3f, TF translation=%s",
+        depth_w, depth_h, rgb_w, rgb_h,
+        registration_info["registered_valid_coverage"],
+        registration_info["translation_color_from_depth_m"],
+    )
+
+    fx = float(info_msg.K[0])
+    fy = float(info_msg.K[4])
+    cx = float(info_msg.K[2])
+    cy = float(info_msg.K[5])
+    if fx <= 0 or fy <= 0:
+        raise RuntimeError("Invalid color camera intrinsics")
+
+    evaluated = []
+    for candidate in candidates:
+        u_rgb, v_rgb = candidate["point_rgb"]
+        point_depth, stats = read_depth_at_rgb(
+            depth_m,
+            u_rgb,
+            v_rgb,
+            scale_x,
+            scale_y,
+            radius_depth,
+            min_depth,
+            max_depth,
+        )
+
+        valid = stats is not None
+        rejection = ""
+
+        if stats is None:
+            validity_score = 0.0
+            consistency_score = 0.0
+            valid = False
+            rejection = "no depth"
+        else:
+            validity_score = stats["valid_ratio"]
+            consistency_score = max(
+                0.0,
+                min(1.0, 1.0 - stats["mad_depth_m"] / max_mad),
+            )
+
+            if stats["valid_ratio"] < min_valid_ratio:
+                valid = False
+                rejection = "low valid-depth ratio"
+            elif stats["mad_depth_m"] > max_mad:
+                valid = False
+                rejection = "depth discontinuity"
+
+        combined = (
+            0.50 * candidate["semantic_region_score"]
+            + 0.28 * validity_score
+            + 0.22 * consistency_score
+        )
+        if not valid:
+            combined = -1.0
+
+        evaluated.append({
+            **candidate,
+            "point_depth": point_depth,
+            "valid": valid,
+            "rejection_reason": rejection,
+            "combined_score": float(combined),
+            "depth_statistics": stats,
+        })
+
+    valid_items = [item for item in evaluated if item["valid"]]
+    if not valid_items:
+        raise RuntimeError("All candidates failed depth validation")
+
+    # Rank candidates, then apply opening evidence and gripper-width gates.
+    valid_items.sort(
+        key=lambda item: item["combined_score"],
+        reverse=True,
+    )
+
+    selected = None
+    selected_opening_evidence = None
+    selected_width_info = None
+
+    # Detect the cup/bowl cavity once across all depth-valid rim candidates.
+    # The previous implementation required every individual rim seed to
+    # independently rediscover the same cavity. With low-resolution native
+    # depth, valid rim seeds near one side can miss the connected cavity even
+    # though another seed clearly detects it. Preserve strict safety by using
+    # only a globally VALIDATED connected cavity; never invent or bypass one.
+    global_opening_evidence = None
+    opening_evidence_by_pixel = {}
+    if (
+        strategy == "rim_pinch"
+        and properties.get("hollow") is True
+        and properties.get("opening_visible") is True
+    ):
+        validated_openings = []
+        for evidence_item in valid_items:
+            key = tuple(evidence_item["point_rgb"])
+            evidence = opening_depth_evidence(
+                bbox,
+                depth_m,
+                scale_x,
+                scale_y,
+                radius_depth,
+                min_depth,
+                max_depth,
+                evidence_item["point_rgb"],
+                opening_depth_threshold_m,
+            )
+            opening_evidence_by_pixel[key] = evidence
+            if evidence.get("validated", False):
+                validated_openings.append(evidence)
+
+        if validated_openings:
+            # Prefer the strongest connected cavity: first depth recess, then
+            # connected component size.
+            global_opening_evidence = max(
+                validated_openings,
+                key=lambda evidence: (
+                    float(evidence.get("depth_difference_m", 0.0)),
+                    int(evidence.get("selected_component_size", 0)),
+                ),
+            )
+            rospy.logwarn(
+                "Global connected cavity validated: recess=%.4f m component=%d",
+                float(global_opening_evidence.get("depth_difference_m", 0.0)),
+                int(global_opening_evidence.get("selected_component_size", 0)),
+            )
+        else:
+            rospy.logwarn(
+                "No globally validated connected cavity across %d rim candidates",
+                len(valid_items),
+            )
+
+    for item in valid_items:
+        measured_z = item["depth_statistics"]["median_depth_m"]
+
+        bbox_size = estimate_bbox_size_m(
+            candidate_bbox,
+            measured_z,
+            fx,
+            fy,
+        )
+
+        if strategy in (
+            "rim_pinch",
+            "edge_pinch",
+            "outer_side_pinch",
+        ):
+            radial_width = radial_local_width_m(
+                candidate_bbox,
+                item,
+                depth_m,
+                scale_x,
+                scale_y,
+                fx,
+                fy,
+                local_width_depth_tolerance_m,
+                local_width_max_scan_px,
+                min_depth,
+                max_depth,
+            )
+            if radial_width is None:
+                item["valid"] = False
+                item["rejection_reason"] = (
+                    "could not estimate radial local rim/edge width"
+                )
+                continue
+
+            closing_width_m = radial_width["width_m"]
+            local_width_axis = radial_width["axis"]
+            local_span_depth_px = radial_width["span_depth_px"]
+            radial_direction_rgb = radial_width[
+                "radial_direction_rgb"
+            ]
+
+        elif strategy in (
+            "handle_pinch",
+            "neck_pinch",
+        ):
+            closing_width_m, local_width_axis, local_span_depth_px = (
+                local_closing_width_m(
+                    candidate_bbox,
+                    item,
+                    depth_m,
+                    scale_x,
+                    scale_y,
+                    fx,
+                    fy,
+                    axis_rule,
+                    local_width_depth_tolerance_m,
+                    local_width_max_scan_px,
+                    min_depth,
+                    max_depth,
+                )
+            )
+            radial_direction_rgb = None
+
+        else:
+            closing_width_m, _unused_size = estimate_closing_width_m(
+                candidate_bbox,
+                measured_z,
+                fx,
+                fy,
+                axis_rule,
+                item["point_rgb"],
+            )
+            local_width_axis = "bbox_estimate"
+            local_span_depth_px = None
+            radial_direction_rgb = None
+
+        if closing_width_m > usable_gripper_width_m:
+            item["valid"] = False
+            item["rejection_reason"] = (
+                "estimated closing width {:.3f} m exceeds usable {:.3f} m"
+                .format(closing_width_m, usable_gripper_width_m)
+            )
+            continue
+
+        if closing_width_m < min_local_grasp_width_m:
+            item["valid"] = False
+            item["rejection_reason"] = (
+                "estimated local width {:.3f} m is too small/noisy"
+                .format(closing_width_m)
+            )
+            continue
+
+        # Measure the radial span now, but for rim_pinch defer the final span
+        # decision until after opening validation. Kinova Vision's 480x270 depth
+        # can merge a thin rim with the adjacent inner wall, producing a span
+        # around 0.6 even when RGB edge and cavity evidence are correct.
+        bbox_size_for_fraction = max(
+            bbox_size["bbox_width_m"],
+            bbox_size["bbox_height_m"],
+            1e-6,
+        )
+        radial_span_fraction = (
+            closing_width_m / bbox_size_for_fraction
+        )
+
+        if strategy in ("edge_pinch", "outer_side_pinch"):
+            if (
+                radial_span_fraction > max_local_span_fraction
+                and bbox_size_for_fraction > usable_gripper_width_m
+            ):
+                item["valid"] = False
+                item["rejection_reason"] = (
+                    "radial span fraction {:.3f} exceeds allowed {:.3f}; "
+                    "looks like object body/interior, not a local edge"
+                ).format(
+                    radial_span_fraction,
+                    max_local_span_fraction,
+                )
+                continue
+
+        opening_evidence = None
+        if (
+            strategy == "rim_pinch"
+            and properties.get("hollow") is True
+            and properties.get("opening_visible") is True
+        ):
+            opening_evidence = opening_evidence_by_pixel.get(
+                tuple(item["point_rgb"])
+            )
+            if (
+                opening_evidence is None
+                or not opening_evidence.get("validated", False)
+            ) and global_opening_evidence is not None:
+                # Reuse only independently validated global cavity evidence.
+                # The ridge/edge/radial checks remain candidate-specific below.
+                opening_evidence = dict(global_opening_evidence)
+                opening_evidence["candidate_used_global_cavity"] = True
+            elif opening_evidence is not None:
+                opening_evidence = dict(opening_evidence)
+                opening_evidence["candidate_used_global_cavity"] = False
+
+            # A visible hollow rim grasp must demonstrate a real recessed
+            # opening. Otherwise a broad interior/body surface can be mistaken
+            # for the nearest stable rim.
+            if (
+                require_validated_opening_for_rim
+                and not opening_evidence["validated"]
+            ):
+                item["valid"] = False
+                item["rejection_reason"] = (
+                    "rim grasp rejected: "
+                    + opening_evidence["reason"]
+                )
+                continue
+
+            if outward_requested and not opening_evidence["validated"]:
+                item["valid"] = False
+                item["rejection_reason"] = (
+                    "outward shift blocked: "
+                    + opening_evidence["reason"]
+                )
+                continue
+
+            # Keep the strict 0.40 span gate by default. Only a candidate with
+            # independently validated connected cavity evidence may use the
+            # wider depth-resolution allowance (default 0.65).
+            allowed_rim_span_fraction = (
+                rim_validated_opening_span_fraction
+                if opening_evidence.get("validated", False)
+                else rim_max_local_span_fraction
+            )
+            if (
+                radial_span_fraction > allowed_rim_span_fraction
+                and bbox_size_for_fraction > usable_gripper_width_m
+            ):
+                item["valid"] = False
+                item["rejection_reason"] = (
+                    "radial span fraction {:.3f} exceeds allowed {:.3f}; "
+                    "validated cavity was insufficient to classify a local rim"
+                ).format(
+                    radial_span_fraction,
+                    allowed_rim_span_fraction,
+                )
+                continue
+
+        # A rim/edge candidate is usable only when its stable surface passes
+        # the strict RGB-edge and radial gates. Never fall back to an
+        # unvalidated seed after a ridge rejection.
+        candidate_ridge_info = None
+        if strategy in ("rim_pinch", "edge_pinch"):
+            candidate_ridge_info = stable_surface_ridge(
+                depth_m,
+                candidate_bbox,
+                item["point_rgb"],
+                fx,
+                scale_x,
+                scale_y,
+                min_depth,
+                max_depth,
+                ridge_search_radius_px,
+                ridge_lateral_half_width_px,
+                ridge_stable_run_px,
+                ridge_max_run_spread_m,
+                ridge_inward_offset_m,
+            )
+            if candidate_ridge_info is None:
+                item["valid"] = False
+                item["rejection_reason"] = (
+                    "no stable local rim/edge surface"
+                )
+                continue
+
+            ridge_point = candidate_ridge_info["ridge_pixel_rgb"]
+            ridge_depth = float(candidate_ridge_info["ridge_depth_m"])
+            ridge_radial = normalized_radial_position(
+                candidate_bbox,
+                ridge_point,
+            )
+            ridge_edge_distance = rgb_edge_distance_px(
+                rgb_image_for_validation,
+                ridge_point,
+            )
+
+            edge_ok = bool(
+                ridge_edge_distance <= rim_edge_max_distance_px
+            )
+            radial_ok = bool(
+                rim_inner_ratio <= ridge_radial <= 1.02
+            )
+
+            # Deep-cavity evidence is required for cup/bowl rim pinches, but
+            # not for plate/thin-object edge pinches.
+            cavity_depth_ok = True
+            if strategy == "rim_pinch":
+                cavity_depth = None
+                cavity_validated = False
+                if opening_evidence is not None:
+                    cavity_validated = bool(
+                        opening_evidence.get("validated", False)
+                    )
+                    cavity_depth = opening_evidence.get(
+                        "interior_depth_m"
+                    )
+                used_global_cavity = bool(
+                    opening_evidence.get("candidate_used_global_cavity", False)
+                ) if opening_evidence is not None else False
+
+                if used_global_cavity:
+                    # Global evidence was measured against another valid rim
+                    # candidate. Do not subtract this candidate's ridge depth
+                    # from that absolute interior depth, because mixing two
+                    # different candidate measurements can incorrectly turn a
+                    # validated recess into cavity_ok=False. Use the already
+                    # validated recess magnitude instead.
+                    cavity_recess = opening_evidence.get(
+                        "depth_difference_m"
+                    )
+                    cavity_depth_ok = bool(
+                        cavity_validated
+                        and cavity_recess is not None
+                        and math.isfinite(float(cavity_recess))
+                        and float(cavity_recess)
+                        >= opening_depth_threshold_m
+                    )
+                else:
+                    # Candidate-specific evidence and ridge depth belong to the
+                    # same local measurement, so the direct comparison is valid.
+                    cavity_depth_ok = bool(
+                        cavity_validated
+                        and cavity_depth is not None
+                        and math.isfinite(float(cavity_depth))
+                        and float(cavity_depth) - ridge_depth
+                        >= opening_depth_threshold_m
+                    )
+
+            candidate_ridge_info["rgb_edge_distance_px"] = (
+                ridge_edge_distance
+            )
+            candidate_ridge_info["normalized_radial_position"] = (
+                ridge_radial
+            )
+            candidate_ridge_info["edge_gate_passed"] = edge_ok
+            candidate_ridge_info["radial_gate_passed"] = radial_ok
+            candidate_ridge_info["cavity_depth_gate_passed"] = (
+                cavity_depth_ok
+            )
+
+            if not (edge_ok and radial_ok and cavity_depth_ok):
+                item["valid"] = False
+                item["rejection_reason"] = (
+                    "stable surface rejected: edge_ok={} radial_ok={} "
+                    "cavity_ok={} edge_distance={:.2f}px radial={:.3f}"
+                ).format(
+                    edge_ok,
+                    radial_ok,
+                    cavity_depth_ok,
+                    ridge_edge_distance,
+                    ridge_radial,
+                )
+                continue
+
+            item["validated_ridge_info"] = candidate_ridge_info
+
+        selected = item
+        selected_opening_evidence = opening_evidence
+        selected_width_info = {
+            **bbox_size,
+            "estimated_closing_width_m": closing_width_m,
+            "width_estimation_mode": (
+                "radial_local_depth_span"
+                if local_width_axis == "radial"
+                else (
+                    "local_depth_connected_span"
+                    if local_span_depth_px is not None
+                    else "bbox_estimate"
+                )
+            ),
+            "local_width_axis": local_width_axis,
+            "local_span_depth_px": local_span_depth_px,
+            "radial_direction_rgb": radial_direction_rgb,
+            "candidate_bbox": candidate_bbox,
+            "gripper_max_opening_m": gripper_max_opening_m,
+            "gripper_safety_margin_m": gripper_safety_margin_m,
+            "usable_gripper_width_m": usable_gripper_width_m,
+            "min_local_grasp_width_m": min_local_grasp_width_m,
+            "max_local_span_fraction": max_local_span_fraction,
+            "rim_max_local_span_fraction": (
+                rim_max_local_span_fraction
+            ),
+            "rim_validated_opening_span_fraction": (
+                rim_validated_opening_span_fraction
+            ),
+            "selected_radial_span_fraction": float(
+                radial_span_fraction
+            ),
+            "requested_rim_inner_ratio": requested_rim_inner_ratio,
+            "effective_rim_inner_ratio": rim_inner_ratio,
+            "requested_rim_outer_ratio": requested_rim_outer_ratio,
+            "effective_rim_outer_ratio": rim_outer_ratio,
+            "requested_rim_edge_max_distance_px": (
+                requested_rim_edge_max_distance_px
+            ),
+            "rim_edge_max_distance_px": rim_edge_max_distance_px,
+            "require_validated_opening_for_rim": (
+                require_validated_opening_for_rim
+            ),
+        }
+        break
+
+    if selected is None:
+        reasons = [
+            item.get("rejection_reason", "unknown")
+            for item in valid_items[:5]
+        ]
+        raise RuntimeError(
+            "No candidate passed strategy, opening, and gripper-width gates: "
+            + "; ".join(reasons)
+        )
+
+    best = selected
+    measured_z = best["depth_statistics"]["median_depth_m"]
+
+    # Use only the stable surface that passed all gates during candidate
+    # selection. No seed fallback is allowed for rim/edge grasps.
+    rim_crest_z = None
+    ridge_info = best.get("validated_ridge_info")
+    if strategy in ("rim_pinch", "edge_pinch"):
+        if ridge_info is None:
+            raise RuntimeError(
+                "Selected rim/edge candidate has no validated stable surface"
+            )
+
+        rim_crest_z = float(ridge_info["ridge_depth_m"])
+        rospy.logwarn(
+            "Validated stable %s surface: seed=%s surface=%s "
+            "seed_depth=%.4f surface_depth=%.4f "
+            "edge_distance=%.2f px radial=%.3f",
+            strategy,
+            ridge_info["seed_pixel_rgb"],
+            ridge_info["ridge_pixel_rgb"],
+            measured_z,
+            rim_crest_z,
+            ridge_info["rgb_edge_distance_px"],
+            ridge_info["normalized_radial_position"],
+        )
+        measured_z = rim_crest_z
+
+    applied_standoff_m = (
+        surface_standoff_m
+        if properties.get("hollow") is True
+        else 0.0
+    )
+    z = max(min_depth, measured_z - applied_standoff_m)
+
+    original_grasp_pixel = list(best["point_rgb"])
+    # Use the closest stable local surface around the validated VLM/depth seed.
+    # A single noisy minimum is never used; the ridge must have contiguous
+    # support and low depth spread.
+    final_grasp_pixel = list(original_grasp_pixel)
+    if ridge_info is not None:
+        final_grasp_pixel = list(ridge_info["ridge_pixel_rgb"])
+    applied_outward_offset_m = 0.0
+
+    if outward_requested and selected_opening_evidence["validated"]:
+        final_grasp_pixel = apply_outward_pixel_offset(
+            bbox,
+            original_grasp_pixel,
+            outward_offset_m,
+            z,
+            fx,
+            fy,
+            rgb_w,
+            rgb_h,
+        )
+        applied_outward_offset_m = outward_offset_m
+
+        # Validate depth at the shifted point too.
+        shifted_depth_pixel, shifted_stats = read_depth_at_rgb(
+            depth_m,
+            final_grasp_pixel[0],
+            final_grasp_pixel[1],
+            scale_x,
+            scale_y,
+            radius_depth,
+            min_depth,
+            max_depth,
+        )
+        if shifted_stats is None:
+            raise RuntimeError(
+                "Outward-shifted grasp point has no valid depth"
+            )
+        best["shifted_point_depth"] = shifted_depth_pixel
+        best["shifted_depth_statistics"] = shifted_stats
+
+    u_rgb, v_rgb = final_grasp_pixel
+
+    native_point_match = native_depth_point_for_color_pixel(
+        native_depth_m,
+        depth_info_msg,
+        info_msg,
+        transform_color_from_depth,
+        u_rgb,
+        v_rgb,
+        min_depth,
+        max_depth,
+    )
+    point_depth = native_point_match["point_depth_m"]
+
+    estimated_local_width_m = float(
+        selected_width_info.get("estimated_closing_width_m", float("inf"))
+    )
+    # Thin-object mode must be based on measured geometry only.
+    # Being semantically classified as a plate is not enough to justify a
+    # 3 mm TCP clearance. The previous plate-category shortcut forced large
+    # plate rims into thin mode even when the measured local width was 36 mm.
+    thin_object_mode = bool(
+        strategy == "edge_pinch"
+        and estimated_local_width_m
+        <= thin_object_width_threshold_m
+    )
+
+    recommended_grasp_clearance_m = None
+    if strategy in ("rim_pinch", "edge_pinch"):
+        # Normal cups/bowls keep the 10 mm physical contact offset.
+        # Plates and geometrically thin edges descend closer using 3 mm.
+        recommended_grasp_clearance_m = max(
+            0.0,
+            (
+                thin_edge_contact_offset_m
+                if thin_object_mode
+                else rim_contact_offset_m
+            ),
+        )
+
+    result = {
+        "success": True,
+        "target": analysis["target"],
+        "object": analysis["object"],
+        "image": analysis["image"],
+        "image_size": analysis["image_size"],
+        "bbox": bbox,
+        "grasp_region_bbox": candidate_bbox,
+        "category": analysis["category"],
+        "shape": analysis["shape"],
+        "properties": properties,
+        "grasp_affordance": affordance,
+        "planner_mode": strategy,
+        "semantic_strategy_original": str(
+            affordance.get("strategy", "not_graspable")
+        ),
+        "plate_edge_override_applied": bool(
+            plate_like_category
+            and str(affordance.get("strategy", "not_graspable"))
+            not in ("not_graspable", "handle_pinch")
+            and strategy == "edge_pinch"
+        ),
+        "gripper_center_rule": center_rule,
+        "grasp_axis_rule": axis_rule,
+        "candidate_count": len(evaluated),
+        "valid_candidate_count": len(
+            [item for item in evaluated if item["valid"]]
+        ),
+        "original_grasp_pixel": original_grasp_pixel,
+        "grasp_pixel": final_grasp_pixel,
+        "center_pixel": final_grasp_pixel,
+        "depth_pixel": best.get(
+            "shifted_point_depth",
+            best["point_depth"],
+        ),
+        "depth_m": z,
+        "measured_depth_m": measured_z,
+        "rim_crest_depth_m": rim_crest_z,
+        "stable_surface_ridge": ridge_info,
+        "stable_surface_ridge_policy": "validated_nearest_rim_surface",
+        "rim_crest_percentile": (
+            rim_crest_percentile if strategy == "rim_pinch" else None
+        ),
+        "surface_standoff_m": applied_standoff_m,
+        "applied_outward_offset_m": applied_outward_offset_m,
+        "opening_depth_evidence": selected_opening_evidence,
+        "recommended_grasp_clearance_m": recommended_grasp_clearance_m,
+        "thin_object_mode": thin_object_mode,
+        "clearance_model": {
+            "type": (
+                "thin_edge_tcp_to_contact_offset"
+                if thin_object_mode
+                else "fixed_tcp_to_finger_contact_offset"
+            ),
+            "normal_contact_offset_m": rim_contact_offset_m,
+            "thin_edge_contact_offset_m": thin_edge_contact_offset_m,
+            "thin_object_width_threshold_m": (
+                thin_object_width_threshold_m
+            ),
+            "selected_contact_offset_m": (
+                recommended_grasp_clearance_m
+            ),
+            "plate_like_category": plate_like_category,
+            "thin_mode_decision_basis": "measured_local_width_only",
+            "measured_local_width_m": estimated_local_width_m,
+            "measured_opening_recess_used_for_validation": (
+                strategy == "rim_pinch"
+            ),
+            "measured_opening_recess_used_for_clearance": False,
+        },
+        "object_size_estimate": selected_width_info,
+        # The robot target is now the native Kinova Vision depth-camera
+        # 3-D point, not an RGB pixel deprojection mislabeled as color frame.
+        "point_camera_m": point_depth,
+        "camera_frame": depth_frame,
+        "point_source": "native_depth_intrinsics_and_depth_frame",
+        "native_depth_correspondence": native_point_match,
+        "depth_frame": depth_frame,
+        "color_frame": color_frame,
+        "depth_registration": registration_info,
+        "native_depth_image_size": [int(depth_w), int(depth_h)],
+        "selection_score": best["combined_score"],
+        "grasp_source": (
+            "qwen_strategy_plus_depth_opening_and_gripper_validation"
+        ),
+    }
+
+    Path(result_json).write_text(json.dumps(result, indent=2))
+
+    image = cv2.imread(analysis["image"])
+    if image is None:
+        raise RuntimeError("Could not reopen RGB image")
+
+    x1, y1, x2, y2 = bbox
+    cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 255), 4)
+
+    gx1, gy1, gx2, gy2 = candidate_bbox
+    cv2.rectangle(
+        image,
+        (gx1, gy1),
+        (gx2, gy2),
+        (0, 255, 0),
+        3,
+    )
+
+    for item in valid_items[1:21]:
+        if not item.get("valid", False):
+            continue
+        u, v = item["point_rgb"]
+        cv2.circle(image, (u, v), 4, (0, 255, 255), -1)
+
+    # Original selected surface point: magenta.
+    cv2.circle(
+        image,
+        tuple(original_grasp_pixel),
+        8,
+        (255, 0, 255),
+        2,
+    )
+
+    # Final commanded gripper-center point: blue.
+    cv2.circle(image, tuple(final_grasp_pixel), 13, (255, 0, 0), -1)
+    cv2.drawMarker(
+        image,
+        tuple(final_grasp_pixel),
+        (255, 0, 0),
+        cv2.MARKER_CROSS,
+        40,
+        4,
+    )
+
+    label = "{} | {} | width={:.3f}m".format(
+        strategy,
+        center_rule,
+        selected_width_info["estimated_closing_width_m"],
+    )
+    cv2.putText(
+        image,
+        label,
+        (max(10, x1), max(30, y1 - 10)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 0, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    if not cv2.imwrite(output_image, image):
+        raise RuntimeError("Could not save {}".format(output_image))
+
+    rospy.loginfo(
+        "Selected strategy=%s original=%s final=%s measured_z=%.4f "
+        "commanded_z=%.4f outward_offset=%.3f m estimated_width=%.3f m",
+        strategy,
+        original_grasp_pixel,
+        final_grasp_pixel,
+        measured_z,
+        z,
+        applied_outward_offset_m,
+        selected_width_info["estimated_closing_width_m"],
+    )
+    if recommended_grasp_clearance_m is not None:
+        rospy.logwarn(
+            "Contact clearance: mode=%s strategy=%s "
+            "local_width=%.3f m threshold=%.3f m "
+            "selected_offset=%.3f m",
+            (
+                "thin_edge"
+                if thin_object_mode
+                else "normal_edge_or_rim"
+            ),
+            strategy,
+            estimated_local_width_m,
+            thin_object_width_threshold_m,
+            recommended_grasp_clearance_m,
+        )
+    rospy.loginfo("Saved: %s", result_json)
+    rospy.loginfo("Saved: %s", output_image)
+    print(json.dumps(result, indent=2))
+    print(output_image)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        rospy.logerr("%s", exc)
+        sys.exit(1)
